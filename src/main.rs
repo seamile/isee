@@ -21,6 +21,10 @@ fn main() -> ExitCode {
             print!("{}", cli::USAGE);
             return ExitCode::SUCCESS;
         }
+        Err(cli::ParseError::Version) => {
+            println!("isee {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
             eprintln!("isee: {e}");
             eprint!("{}", cli::USAGE);
