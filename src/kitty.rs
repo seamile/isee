@@ -86,6 +86,7 @@ mod tests {
             quality: 50,
             cell: crate::detect::CellPx { w: 9, h: 18 },
             win: crate::detect::WinSize { cols: 80, rows: 24 },
+            dpi: None,
         };
         let out = render(&img, &o, 42);
         let s = String::from_utf8_lossy(&out);

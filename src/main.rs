@@ -4,6 +4,7 @@ mod halfblock;
 mod info;
 mod input;
 mod kitty;
+mod meta;
 mod size;
 
 use std::fmt;
@@ -78,11 +79,13 @@ fn run(args: &cli::Args) -> Result<(), AppErr> {
         quality: args.quality.unwrap_or(50),
         cell: term.cell,
         win: term.win,
+        dpi: loaded.dpi,
     };
-    let bytes = match term.protocol {
+    let mut bytes = match term.protocol {
         Protocol::Kitty => kitty::render(&loaded.img, &opts, kitty::new_image_id()),
         Protocol::HalfBlocks => halfblock::render(&loaded.img, &opts).into_bytes(),
     };
+    bytes.push(b'\n');
     let bytes = if term.tmux {
         detect::wrap_passthrough(&bytes)
     } else {
