@@ -3,7 +3,7 @@ use image::{DynamicImage, RgbaImage};
 use crate::size::{self, RenderOpts};
 
 pub fn render(img: &DynamicImage, o: &RenderOpts) -> String {
-    let (tw, th) = size::target_px(img, o);
+    let (tw, th) = size::target_px(img, o, size::halfblock_bounds(o));
     let cells_w = tw.div_ceil(o.cell.w.max(1)).max(1);
     let cells_h = th.div_ceil(o.cell.h.max(1)).max(1);
     let px_h = cells_h * 2;

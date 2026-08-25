@@ -17,7 +17,7 @@ pub fn new_image_id() -> u32 {
 }
 
 pub fn render(img: &DynamicImage, o: &RenderOpts, id: u32) -> Vec<u8> {
-    let (tw, th) = size::target_px(img, o);
+    let (tw, th) = size::target_px(img, o, size::kitty_bounds(o));
     let rgba = if tw == img.width() && th == img.height() {
         img.to_rgba8()
     } else {
@@ -26,8 +26,11 @@ pub fn render(img: &DynamicImage, o: &RenderOpts, id: u32) -> Vec<u8> {
     let (w, h) = rgba.dimensions();
     // Grid of cells that will hold the placeholder; only anchors placement,
     // it does NOT re-scale the image (no c= / r= in the control sequence).
-    let cols = (w as f64 / o.cell.w.max(1) as f64).ceil().max(1.0) as u32;
-    let rows = (h as f64 / o.cell.h.max(1) as f64).ceil().max(1.0) as u32;
+    // The cell here is the DEVICE-pixel cell so the grid matches the image's
+    // physical size on HiDPI screens (logical cells would double the grid).
+    let (cw, ch) = size::kitty_cell(o);
+    let cols = (w as f64 / cw as f64).ceil().max(1.0) as u32;
+    let rows = (h as f64 / ch as f64).ceil().max(1.0) as u32;
 
     let mut out = encode(&rgba, w, h, id);
     place(&mut out, cols, rows, id);
@@ -65,16 +68,16 @@ fn encode(rgba: &image::RgbaImage, w: u32, h: u32, id: u32) -> Vec<u8> {
 fn place(out: &mut Vec<u8>, cols: u32, rows: u32, id: u32) {
     let (r, g, b) = ((id >> 16) & 0xff, (id >> 8) & 0xff, id & 0xff);
     write!(out, "\x1b[38;2;{r};{g};{b}m").unwrap();
-    // Save the cursor once so every row is anchored to the same origin. Using a
-    // bare LF (`\n`) between rows leaves the cursor at the row's end column and
-    // shifts subsequent rows right, fragmenting the image into horizontal bands.
-    // yazi avoids this with an absolute MoveTo per row; we emulate that here by
-    // restoring the origin and moving down `y` rows before writing each row.
-    out.extend_from_slice(b"\x1b[s");
+    // Emit the grid as plain text lines separated by CRLF. CR guarantees each
+    // row restarts at column 1 (a bare LF keeps the end column and shifts
+    // subsequent rows right, fragmenting the image into horizontal bands),
+    // while letting the terminal scroll naturally like any CLI output keeps
+    // the shell prompt exactly one line below the image with no blank gap.
+    // yazi instead positions every row with an absolute MoveTo because a TUI
+    // must never scroll.
     for y in 0..rows {
-        out.extend_from_slice(b"\x1b[u");
         if y > 0 {
-            out.extend_from_slice(format!("\x1b[{y}B").as_bytes());
+            out.extend_from_slice(b"\r\n");
         }
         let dy = *DIACRITICS.get(y as usize).unwrap_or(&DIACRITICS[0]);
         for x in 0..cols {
@@ -88,12 +91,10 @@ fn place(out: &mut Vec<u8>, cols: u32, rows: u32, id: u32) {
             }
         }
     }
-    // Park the cursor on the row just below the image, at the original column.
-    out.extend_from_slice(b"\x1b[u");
-    if rows > 0 {
-        out.extend_from_slice(format!("\x1b[{rows}B").as_bytes());
-    }
+    // Reset attributes, then park the cursor on the line below the image so
+    // the shell prompt never overwrites the last placeholder row.
     out.extend_from_slice(b"\x1b[0m");
+    out.extend_from_slice(b"\r\n");
 }
 
 /// Combining marks that vary each placeholder cell so the terminal does not
@@ -429,7 +430,7 @@ mod tests {
             width: None,
             quality: 50,
             cell: crate::detect::CellPx { w: 9, h: 18 },
-            win: crate::detect::WinSize { cols: 80, rows: 24 },
+            win: crate::detect::WinSize { cols: 80, rows: 24, px: None },
         }
     }
 
@@ -462,7 +463,25 @@ mod tests {
         assert!(!s.contains("c="), "must not send c=, got {s}");
         assert!(!s.contains("r="), "must not send r=, got {s}");
         assert!(s.contains('\u{10EEEE}'), "must emit placeholder, got {s}");
-        assert!(s.ends_with("\x1b[0m"));
+        assert!(s.ends_with("\x1b[0m\r\n"));
+    }
+
+    #[test]
+    fn hidpi_grid_uses_physical_cell() {
+        // Retina: 80x24 grid, window px 1440x864 (device), probed cell 9x18
+        // (logical). The placeholder grid must use the physical 18x36 cell so
+        // it matches the image's rendered size instead of doubling it.
+        let mut o = opts();
+        o.win.px = Some((1440, 864));
+        let img = DynamicImage::new_rgba8(982, 548);
+        let out = render(&img, &o, 42);
+        let s = String::from_utf8_lossy(&out);
+        // Native size fits the 1440x864 bounds; grid ceil(982/18) x ceil(548/36).
+        assert!(
+            s.starts_with("\x1b_Ga=T,C=1,U=1,f=32,s=982,v=548,i=42,q=2,m=1;"),
+            "got {s}"
+        );
+        assert_eq!(s.matches('\u{10EEEE}').count(), 55 * 16);
     }
 
     #[test]
@@ -497,17 +516,21 @@ mod tests {
     }
 
     #[test]
-    fn multiline_placeholder_uses_cursor_positioning_not_lf() {
+    fn multiline_placeholder_separates_rows_with_crlf() {
         let img = DynamicImage::new_rgba8(2, 36);
         let out = render(&img, &opts(), 42);
         let s = std::str::from_utf8(&out).unwrap();
-        // Save origin and restore it before each row; no bare LF separates rows.
-        assert!(s.contains("\x1b[s"), "save cursor missing: {s}");
-        assert!(s.contains("\x1b[u"), "restore cursor missing: {s}");
-        assert_eq!(s.matches('\n').count(), 0, "placeholder rows must not use LF");
-        // Row 1 anchors via restore + down 1. After all rows the cursor is
-        // parked on the line below the image (orig + rows).
-        assert!(s.contains("\x1b[u\x1b[1B"), "row 1 positioning missing: {s}");
-        assert!(s.ends_with("\x1b[u\x1b[2B\x1b[0m"));
+        // Rows are plain text lines separated by CRLF, plus one trailing CRLF
+        // that parks the cursor below the image; no bare LF and no cursor
+        // save/restore positioning.
+        assert!(!s.contains("\x1b[s"), "save cursor must not be used: {s}");
+        assert!(!s.contains("\x1b[u"), "restore cursor must not be used: {s}");
+        assert_eq!(s.matches('\n').count(), 2, "expected 1 separator + 1 trailing");
+        for (i, b) in s.bytes().enumerate() {
+            if b == b'\n' {
+                assert_eq!(s.as_bytes()[i - 1], b'\r', "LF at byte {i} lacks CR");
+            }
+        }
+        assert!(s.ends_with("\x1b[0m\r\n"));
     }
 }
