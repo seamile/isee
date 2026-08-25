@@ -1,0 +1,17 @@
+[package]
+name = "isee"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Seamile <lanhuermao@gmail.com>"]
+description = "A small tool for previewing images in the terminal."
+homepage = "https://github.com/seamile/isee"
+repository = "https://github.com/seamile/isee"
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "isee"
+path = "src/main.rs"
+
+[dependencies]
