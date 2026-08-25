@@ -8,8 +8,11 @@ pub fn render(img: &DynamicImage, o: &RenderOpts) -> String {
     let cells_h = th.div_ceil(o.cell.h.max(1)).max(1);
     let px_h = cells_h * 2;
 
-    let resized = img.resize(cells_w, px_h, size::filter(o.quality));
-    let rgba = resized.to_rgba8();
+    let rgba = if cells_w == img.width() && px_h == img.height() {
+        img.to_rgba8()
+    } else {
+        img.resize(cells_w, px_h, size::filter(o.quality)).to_rgba8()
+    };
 
     let mut out = String::with_capacity(cells_w as usize * cells_h as usize * 40 + cells_h as usize);
     use std::fmt::Write as _;
