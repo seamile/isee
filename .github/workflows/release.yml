@@ -24,10 +24,6 @@ jobs:
             target: aarch64-apple-darwin
             artifact_name: isee
             asset_name: isee-macos-aarch64.tgz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: isee.exe
-            asset_name: isee-windows-x86_64.zip
 
     steps:
       - name: Checkout code
@@ -52,16 +48,9 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package (POSIX)
-        if: matrix.os != 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
-
-      - name: Package (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
 
       - name: Upload Artifacts
         uses: softprops/action-gh-release@v2

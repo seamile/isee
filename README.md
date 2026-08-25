@@ -7,6 +7,9 @@ with either the **Kitty graphics protocol** (with Unicode placeholder cells for
 precise sizing) or **Half Blocks** (color-reduced character pairs) as a fallback
 for terminals without graphics support.
 
+> **Platform support** — `isee` is currently built and tested on Linux and
+> macOS. Windows is not yet supported.
+
 ## Usage
 
 ```
