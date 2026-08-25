@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -34,7 +34,7 @@ pub struct TerminalInfo {
     pub tmux: bool,
 }
 
-const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const KGP_PROBE: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 const CSI_CELL_PX: &[u8] = b"\x1b[16t";
 const MAX_RESPONSE: usize = 4096;
@@ -54,11 +54,16 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
 
     if override_p.is_none()
         && stdout_tty
-        && !tmux
         && let Some(mut tty) = RawTty::new()
     {
-        probed_kitty = probe_kgp(&mut tty);
-        if let Some(c) = probe_cell_px(&mut tty) {
+        // Inside tmux the pane's own terminal is tmux's virtual terminal;
+        // probe the OUTER terminal by wrapping the queries in tmux's DCS
+        // passthrough (mirroring yazi), after making sure passthrough is on.
+        if tmux {
+            enable_tmux_passthrough();
+        }
+        probed_kitty = probe_kgp(&mut tty, tmux);
+        if let Some(c) = probe_cell_px(&mut tty, tmux) {
             cell = c;
         }
         drain_input(tty.file.as_raw_fd());
@@ -151,22 +156,62 @@ fn win_size(fd: i32) -> WinSize {
     }
 }
 
-fn probe_kgp(tty: &mut RawTty) -> bool {
-    if tty.file.write_all(KGP_PROBE).is_err() {
+/// Let this pane's DCS passthrough sequences reach the outer terminal and
+/// survive the trip: tmux caps input buffers small by default, which
+/// truncates large passthrough image transfers (mirrors yazi's tmux_setup()).
+fn enable_tmux_passthrough() {
+    use std::process::{Command, Stdio};
+    let quiet = |cmd: &mut Command| {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    };
+    quiet(
+        Command::new("tmux").args(["set", "-p", "allow-passthrough", "all"]),
+    );
+    quiet(
+        Command::new("tmux").args(["set", "-s", "input-buffer-size", "104857600"]),
+    );
+}
+
+fn write_probe(tty: &mut RawTty, seq: &[u8], passthrough: bool) -> bool {
+    let out = if passthrough { wrap_passthrough(seq) } else { seq.to_vec() };
+    tty.file.write_all(&out).is_ok()
+}
+
+fn probe_kgp(tty: &mut RawTty, passthrough: bool) -> bool {
+    if !write_probe(tty, KGP_PROBE, passthrough) {
         return false;
     }
-    match read_until(&tty.file, b"\x1b\\", PROBE_TIMEOUT) {
-        Some(r) => {
+    match read_until(tty, b"\x1b\\", PROBE_TIMEOUT) {
+        ProbeRead::Found(r) => {
+            dbg_dump("kgp", &r);
             let s = String::from_utf8_lossy(&r);
             s.contains("OK") && s.contains("i=31")
         }
-        None => false,
+        ProbeRead::Timeout(r) => {
+            dbg_dump("kgp-timeout", &r);
+            false
+        }
     }
 }
 
-fn probe_cell_px(tty: &mut RawTty) -> Option<CellPx> {
-    tty.file.write_all(CSI_CELL_PX).ok()?;
-    let r = read_until(&tty.file, b"t", PROBE_TIMEOUT)?;
+fn probe_cell_px(tty: &mut RawTty, passthrough: bool) -> Option<CellPx> {
+    if !write_probe(tty, CSI_CELL_PX, passthrough) {
+        return None;
+    }
+    let r = match read_until(tty, b"t", PROBE_TIMEOUT) {
+        ProbeRead::Found(r) => {
+            dbg_dump("cell", &r);
+            r
+        }
+        ProbeRead::Timeout(r) => {
+            dbg_dump("cell-timeout", &r);
+            return None;
+        }
+    };
     parse_csi_t(&r)
 }
 
@@ -189,43 +234,88 @@ fn parse_csi_t(raw: &[u8]) -> Option<CellPx> {
     }
 }
 
-fn read_until(file: &File, term: &[u8], timeout: Duration) -> Option<Vec<u8>> {
-    let fd = file.as_raw_fd();
+enum ProbeRead {
+    Found(Vec<u8>),
+    Timeout(Vec<u8>),
+}
+
+fn dbg_dump(label: &str, buf: &[u8]) {
+    if env::var("ISEE_DEBUG").is_ok() {
+        eprintln!(
+            "isee probe {label}: {} bytes: {}",
+            buf.len(),
+            buf.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+    }
+}
+
+/// Wait until `fd` is readable using select(2).
+/// macOS poll(2) reports POLLNVAL for /dev/tty, so poll is unusable here.
+fn wait_readable(fd: i32, timeout_ms: i32) -> bool {
+    if fd < 0 || fd >= libc::FD_SETSIZE as i32 {
+        return false;
+    }
+    unsafe {
+        let mut rfds: libc::fd_set = std::mem::zeroed();
+        libc::FD_ZERO(&mut rfds);
+        libc::FD_SET(fd, &mut rfds);
+        let mut tv = libc::timeval {
+            tv_sec: (timeout_ms / 1000) as libc::time_t,
+            tv_usec: ((timeout_ms % 1000) * 1000) as libc::suseconds_t,
+        };
+        let rc = libc::select(
+            fd + 1,
+            &mut rfds,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut tv,
+        );
+        rc > 0 && libc::FD_ISSET(fd, &rfds)
+    }
+}
+
+/// Read from `tty` until `term` appears. Bytes read past `term` (e.g. the
+/// response to the next probe arriving early) are kept in `tty.pending`.
+fn read_until(tty: &mut RawTty, term: &[u8], timeout: Duration) -> ProbeRead {
+    if let Some(pos) = find_sub(&tty.pending, term) {
+        let rest = tty.pending.split_off(pos + term.len());
+        let found = std::mem::replace(&mut tty.pending, rest);
+        return ProbeRead::Found(found);
+    }
+    let fd = tty.file.as_raw_fd();
     let start = Instant::now();
-    let mut buf = Vec::new();
     let mut tmp = [0u8; 256];
     loop {
         let elapsed = start.elapsed();
         if elapsed >= timeout {
-            return None;
+            return ProbeRead::Timeout(std::mem::take(&mut tty.pending));
         }
-        let remain = (timeout - elapsed).as_millis().min(i32::MAX as u128) as i32;
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, remain) };
-        if rc == 0 {
-            return None;
+        let remain =
+            (timeout - elapsed).as_millis().min(i32::MAX as u128) as i32;
+        if !wait_readable(fd, remain) {
+            return ProbeRead::Timeout(std::mem::take(&mut tty.pending));
         }
-        if rc < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return None;
-        }
-        if pfd.revents & libc::POLLIN == 0 {
-            continue;
-        }
-        let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
+        let n =
+            unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
         if n > 0 {
-            buf.extend_from_slice(&tmp[..n as usize]);
-            if buf.windows(term.len()).any(|w| w == term) || buf.len() >= MAX_RESPONSE {
-                return Some(buf);
+            tty.pending.extend_from_slice(&tmp[..n as usize]);
+            if tty.pending.len() >= MAX_RESPONSE {
+                return ProbeRead::Found(std::mem::take(&mut tty.pending));
+            }
+            if let Some(pos) = find_sub(&tty.pending, term) {
+                let rest = tty.pending.split_off(pos + term.len());
+                let found = std::mem::replace(&mut tty.pending, rest);
+                return ProbeRead::Found(found);
             }
         }
     }
+}
+
+fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn drain_input(fd: i32) {
@@ -242,6 +332,7 @@ struct RawTty {
     file: File,
     orig: libc::termios,
     raw: bool,
+    pending: Vec<u8>,
 }
 
 impl RawTty {
@@ -259,7 +350,7 @@ impl RawTty {
         }
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        Some(RawTty { file, orig, raw: true })
+        Some(RawTty { file, orig, raw: true, pending: Vec::new() })
     }
 }
 
@@ -281,6 +372,31 @@ pub fn wrap_passthrough(output: &[u8]) -> Vec<u8> {
         out.push(b);
     }
     out.extend_from_slice(b"\x1b\\");
+    out
+}
+
+/// tmux-flavoured output for Kitty protocol: wrap each KGP APC chunk
+/// (`ESC _G ... ESC \`) in its own DCS passthrough (mirroring yazi), while
+/// leaving placeholder text, SGR colours and CRLF untouched so they flow
+/// through tmux's pane grid. The grid is what lets tmux draw the placeholders
+/// at the right pane position and re-draw them on refresh — wrapping them in
+/// passthrough would render the image at the client's stray cursor position
+/// and erase it on the next redraw.
+pub fn wrap_kitty_passthrough(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 4096);
+    let mut i = 0;
+    while i < data.len() {
+        if data[i..].starts_with(b"\x1b_G")
+            && let Some(end) = find_sub(&data[i + 2..], b"\x1b\\")
+        {
+            let seq_end = i + 2 + end + 2;
+            out.extend_from_slice(&wrap_passthrough(&data[i..seq_end]));
+            i = seq_end;
+            continue;
+        }
+        out.push(data[i]);
+        i += 1;
+    }
     out
 }
 
@@ -307,5 +423,32 @@ mod tests {
     fn tmux_wrap_doubles_esc() {
         let out = wrap_passthrough(b"\x1b[0m\x1b_Gx\x1b\\");
         assert_eq!(out, b"\x1bPtmux;\x1b\x1b\x1b[0m\x1b\x1b_Gx\x1b\x1b\\\x1b\\");
+    }
+
+    #[test]
+    fn kitty_wrap_only_passthroughs_apc_chunks() {
+        // Two KGP chunks followed by placeholder text (SGR + cell + CRLF).
+        let placeholder = "\u{10EEEE}";
+        let mut data = b"\x1b_Ga=T,m=0;AA\x1b\\\x1b_Gm=0;BB\x1b\\\x1b[38;2;1;2;3m".to_vec();
+        data.extend_from_slice(placeholder.as_bytes());
+        data.extend_from_slice(b"\r\n");
+        let out = wrap_kitty_passthrough(&data);
+        // Each APC chunk gets its own passthrough wrapper...
+        let chunk1 = wrap_passthrough(b"\x1b_Ga=T,m=0;AA\x1b\\");
+        let chunk2 = wrap_passthrough(b"\x1b_Gm=0;BB\x1b\\");
+        let mut expect = chunk1;
+        expect.extend_from_slice(&chunk2);
+        // ...while the placeholder text passes through byte-identical.
+        expect.extend_from_slice(b"\x1b[38;2;1;2;3m");
+        expect.extend_from_slice(placeholder.as_bytes());
+        expect.extend_from_slice(b"\r\n");
+        assert_eq!(out, expect);
+    }
+
+    #[test]
+    fn kitty_wrap_handles_unterminated_apc() {
+        // A trailing "\x1b_G" without terminator is copied verbatim.
+        let data = b"\x1b_Gbroken";
+        assert_eq!(wrap_kitty_passthrough(data), data);
     }
 }

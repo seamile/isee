@@ -95,8 +95,12 @@ fn run(args: &cli::Args) -> Result<(), AppErr> {
     if !matches!(term.protocol, Protocol::Kitty) {
         bytes.push(b'\n');
     }
-    let bytes = if term.tmux {
-        detect::wrap_passthrough(&bytes)
+    let bytes = if term.tmux && matches!(term.protocol, Protocol::Kitty) {
+        // In tmux only the KGP transfer chunks go through DCS passthrough;
+        // placeholder cells must reach tmux's pane grid so the image lands in
+        // the right pane and survives redraws. HalfBlocks are plain text and
+        // need no passthrough at all.
+        detect::wrap_kitty_passthrough(&bytes)
     } else {
         bytes
     };
