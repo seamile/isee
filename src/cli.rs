@@ -12,6 +12,7 @@ pub struct Args {
 #[derive(Debug)]
 pub enum ParseError {
     Help,
+    Version,
     MissingValue(&'static str),
     InvalidNumber(&'static str, String),
     UnknownOption(String),
@@ -22,6 +23,7 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ParseError::Help => write!(f, "help"),
+            ParseError::Version => write!(f, "version"),
             ParseError::MissingValue(opt) => write!(f, "option {opt} requires a value"),
             ParseError::InvalidNumber(opt, v) => write!(f, "invalid value {v:?} for option {opt}"),
             ParseError::UnknownOption(o) => write!(f, "unknown option {o}"),
@@ -39,6 +41,7 @@ Options:
   -w WIDTH   Preview at the given pixel width
   -q QUALITY Preview quality (0-100)
   -i         Show image information
+  -v, --version Print version
   -h, --help Print help
 
 If IMGPATH is omitted, image data is read from stdin.
@@ -62,6 +65,7 @@ where
         }
         match arg.as_str() {
             "-h" | "--help" => return Err(ParseError::Help),
+            "-v" | "--version" => return Err(ParseError::Version),
             "-i" => out.info = true,
             "-w" => {
                 let v = it.next().ok_or(ParseError::MissingValue("-w"))?;
@@ -138,6 +142,12 @@ mod tests {
     fn parse_help() {
         assert!(matches!(parse(["--help"]), Err(ParseError::Help)));
         assert!(matches!(parse(["-h"]), Err(ParseError::Help)));
+    }
+
+    #[test]
+    fn parse_version() {
+        assert!(matches!(parse(["-v"]), Err(ParseError::Version)));
+        assert!(matches!(parse(["--version"]), Err(ParseError::Version)));
     }
 
     #[test]
