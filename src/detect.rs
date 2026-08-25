@@ -30,7 +30,7 @@ pub struct TerminalInfo {
     pub tmux: bool,
 }
 
-const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const KGP_PROBE: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 const CSI_CELL_PX: &[u8] = b"\x1b[16t";
 const MAX_RESPONSE: usize = 4096;
@@ -155,6 +155,10 @@ fn parse_csi_t(raw: &[u8]) -> Option<CellPx> {
     let payload = &s[idx + 1..];
     let body = payload.strip_prefix('[')?.strip_suffix('t')?;
     let mut parts = body.split(';');
+    // CSI 16 t responds with CSI 6 ; cell_height ; cell_width t.
+    if parts.next()?.trim() != "6" {
+        return None;
+    }
     let h: u32 = parts.next()?.trim().parse().ok()?;
     let w: u32 = parts.next()?.trim().parse().ok()?;
     if h == 0 || w == 0 {
@@ -265,10 +269,17 @@ mod tests {
 
     #[test]
     fn csi_t_parse() {
-        assert_eq!(parse_csi_t(b"\x1b[1080;1920t"), Some(CellPx { w: 1920, h: 1080 }));
-        assert_eq!(parse_csi_t(b"junk\x1b[36;40t"), Some(CellPx { w: 40, h: 36 }));
+        assert_eq!(parse_csi_t(b"\x1b[1080;1920t"), None);
+        assert_eq!(parse_csi_t(b"junk\x1b[36;40t"), None);
         assert_eq!(parse_csi_t(b"\x1b[0;0t"), None);
         assert_eq!(parse_csi_t(b"nope"), None);
+    }
+
+    #[test]
+    fn csi_t_parse_cell_px_format() {
+        assert_eq!(parse_csi_t(b"\x1b[6;1080;1920t"), Some(CellPx { w: 1920, h: 1080 }));
+        assert_eq!(parse_csi_t(b"junk\x1b[6;36;40t"), Some(CellPx { w: 40, h: 36 }));
+        assert_eq!(parse_csi_t(b"\x1b[6;0;0t"), None);
     }
 
     #[test]

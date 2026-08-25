@@ -67,7 +67,13 @@ fn run(args: &cli::Args) -> Result<(), AppErr> {
     let stdout = io::stdout();
     if args.info {
         let info = input::load_info(&source).map_err(|e| AppErr::Fatal(e.to_string()))?;
-        print!("{}", info::render(&info));
+        let path = match &source {
+            input::Source::Path(p) => std::fs::canonicalize(p)
+                .map(|x| x.display().to_string())
+                .unwrap_or_else(|_| p.display().to_string()),
+            input::Source::Stdin => "-".to_string(),
+        };
+        print!("{}", info::render(&path, &info));
         io::stdout().flush().map_err(|e| AppErr::Fatal(e.to_string()))?;
         return Ok(());
     }
@@ -79,13 +85,16 @@ fn run(args: &cli::Args) -> Result<(), AppErr> {
         quality: args.quality.unwrap_or(50),
         cell: term.cell,
         win: term.win,
-        dpi: loaded.dpi,
     };
     let mut bytes = match term.protocol {
         Protocol::Kitty => kitty::render(&loaded.img, &opts, kitty::new_image_id()),
         Protocol::HalfBlocks => halfblock::render(&loaded.img, &opts).into_bytes(),
     };
-    bytes.push(b'\n');
+    // Kitty's placement already parks the cursor on the row below the image;
+    // appending a newline here would push the prompt even further down.
+    if !matches!(term.protocol, Protocol::Kitty) {
+        bytes.push(b'\n');
+    }
     let bytes = if term.tmux {
         detect::wrap_passthrough(&bytes)
     } else {
