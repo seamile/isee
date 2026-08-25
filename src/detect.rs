@@ -54,8 +54,13 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
 
     if override_p.is_none()
         && stdout_tty
+        && env_kitty
         && let Some(mut tty) = RawTty::new()
     {
+        // Only probe when the environment signals Kitty support. Sending the
+        // KGP query to an unsupporting terminal leaks the APC payload as
+        // visible text, so never probe a bare xterm/screen-style terminal
+        // (TERM=xterm-256color etc.) where it can only be a no-op.
         // Inside tmux the pane's own terminal is tmux's virtual terminal;
         // probe the OUTER terminal by wrapping the queries in tmux's DCS
         // passthrough (mirroring yazi), after making sure passthrough is on.
