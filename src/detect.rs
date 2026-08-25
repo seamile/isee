@@ -20,6 +20,10 @@ pub struct CellPx {
 pub struct WinSize {
     pub cols: u32,
     pub rows: u32,
+    /// Text-area size in device pixels from TIOCGWINSZ (ws_xpixel/ws_ypixel),
+    /// as reported by kitty/Ghostty/iTerm2. None when the ioctl reports no
+    /// pixel geometry (pipes, some terminals).
+    pub px: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -66,12 +70,19 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
         None => Protocol::HalfBlocks,
     };
 
-    TerminalInfo {
+    let info = TerminalInfo {
         protocol,
         cell,
         win: win_size(stdout_fd),
         tmux,
+    };
+    if env::var("ISEE_DEBUG").is_ok() {
+        eprintln!(
+            "isee: protocol={:?} cell={}x{} win={}x{} px={:?} tmux={}",
+            info.protocol, info.cell.w, info.cell.h, info.win.cols, info.win.rows, info.win.px, tmux
+        );
     }
+    info
 }
 
 fn in_tmux() -> bool {
@@ -120,12 +131,22 @@ fn win_size(fd: i32) -> WinSize {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+            let px = if ws.ws_xpixel > 0 && ws.ws_ypixel > 0 {
+                Some((ws.ws_xpixel as u32, ws.ws_ypixel as u32))
+            } else {
+                None
+            };
             WinSize {
                 cols: ws.ws_col as u32,
                 rows: ws.ws_row as u32,
+                px,
             }
         } else {
-            WinSize { cols: 80, rows: 24 }
+            WinSize {
+                cols: 80,
+                rows: 24,
+                px: None,
+            }
         }
     }
 }
