@@ -2,22 +2,20 @@ use image::{DynamicImage, GenericImageView};
 
 use crate::detect::{CellPx, WinSize};
 
-/// Scaling bounds for the Kitty protocol, in DEVICE pixels. The graphics
-/// protocol's s=/v= are physical pixels, so on HiDPI (DPR=2) screens a
-/// logical-pixel bound would render the image at half size.
+/// Scaling bounds for the Kitty protocol, in DEVICE pixels: the physical
+/// cell times the grid. Deriving the bounds and the placeholder grid from
+/// the SAME cell guarantees `ceil(w/cell) <= cols`, so an ultra-wide image
+/// can never wrap its last placeholder column onto the next line.
 ///
-/// Sources are combined with max() so either one being physical wins even if
-/// the other reports logical units (terminal-dependent):
-///   - TIOCGWINSZ window pixels (`win.px`), already DPI-scaled on
-///     kitty/Ghostty/iTerm2
-///   - the probed/fallback cell size times the grid (cols*cell.w)
+/// The raw window-pixel report (`win.px`) is deliberately NOT used as a
+/// bound: on Ghostty it includes window padding, which can exceed the grid
+/// by a fraction of a cell and push the grid past the last column.
 pub fn kitty_bounds(o: &RenderOpts) -> (u64, u64) {
-    let cw = (o.win.cols as u64 * o.cell.w.max(1) as u64).max(1);
-    let ch = (o.win.rows as u64 * o.cell.h.max(1) as u64).max(1);
-    match o.win.px {
-        Some((pw, ph)) => (cw.max(pw as u64), ch.max(ph as u64)),
-        None => (cw, ch),
-    }
+    let (cw, ch) = kitty_cell(o);
+    (
+        (o.win.cols as u64 * cw as u64).max(1),
+        (o.win.rows as u64 * ch as u64).max(1),
+    )
 }
 
 /// Physical cell size for the Kitty placeholder grid: max() of the probed
@@ -150,14 +148,31 @@ mod tests {
 
     #[test]
     fn hidpi_px_report_doubles_bounds() {
-        // Retina: 80x24 grid, window reports 1440x864 device px. Bounds must
-        // use the larger physical size, not the logical 720x432.
+        // Retina: 80x24 grid, window reports 1440x864 device px. The physical
+        // cell is 18x36, so bounds = 80*18 x 24*36 = 1440x864 (not the
+        // logical 720x432).
         let mut o = opts();
         o.win.px = Some((1440, 864));
+        assert_eq!(kitty_cell(&o), (18, 36));
         assert_eq!(kitty_bounds(&o), (1440, 864));
         // 982x548 now fits natively; a 2000x1000 image scales to 1440x720.
         assert_eq!(target_px(&img(982, 548), &o, kitty_bounds(&o)), (982, 548));
         assert_eq!(target_px(&img(2000, 1000), &o, kitty_bounds(&o)), (1440, 720));
+    }
+
+    #[test]
+    fn padded_px_report_cannot_overflow_grid() {
+        // Ghostty includes window padding in ws_xpixel: 1450x870 for the same
+        // 80x24 grid of 18x36 cells. The bounds must stay at the exact grid
+        // (1440x864) so the placeholder grid never exceeds the terminal
+        // columns/rows and the last column cannot wrap to the next line.
+        let mut o = opts();
+        o.win.px = Some((1450, 870));
+        assert_eq!(kitty_cell(&o), (18, 36));
+        assert_eq!(kitty_bounds(&o), (1440, 864));
+        // Ultra-wide image caps at 1440 wide -> exactly 80 placeholder cols.
+        let (tw, _) = target_px(&img(3000, 1000), &o, kitty_bounds(&o));
+        assert_eq!(tw.div_ceil(kitty_cell(&o).0), 80);
     }
 
     #[test]
