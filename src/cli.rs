@@ -6,7 +6,7 @@ pub struct Args {
     pub width: Option<u32>,
     pub quality: Option<u8>,
     pub info: bool,
-    pub path: Option<PathBuf>,
+    pub paths: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -16,7 +16,6 @@ pub enum ParseError {
     MissingValue(&'static str),
     InvalidNumber(&'static str, String),
     UnknownOption(String),
-    TooManyArgs(String),
 }
 
 impl fmt::Display for ParseError {
@@ -27,15 +26,14 @@ impl fmt::Display for ParseError {
             ParseError::MissingValue(opt) => write!(f, "option {opt} requires a value"),
             ParseError::InvalidNumber(opt, v) => write!(f, "invalid value {v:?} for option {opt}"),
             ParseError::UnknownOption(o) => write!(f, "unknown option {o}"),
-            ParseError::TooManyArgs(a) => write!(f, "unexpected argument {a:?}"),
         }
     }
 }
 
 pub const USAGE: &str = "\
-Usage: isee [OPTIONS] [IMGPATH]
+Usage: isee [OPTIONS] [IMGPATH ...]
 
-Preview an image in the terminal.
+Preview images in the terminal.
 
 Options:
   -w WIDTH   Preview at the given pixel width
@@ -78,12 +76,7 @@ where
             s if s.starts_with('-') && s.len() > 1 => {
                 return Err(ParseError::UnknownOption(s.to_string()));
             }
-            s => {
-                if out.path.is_some() {
-                    return Err(ParseError::TooManyArgs(s.to_string()));
-                }
-                out.path = Some(PathBuf::from(s));
-            }
+            s => out.paths.push(PathBuf::from(s)),
         }
     }
     Ok(out)
@@ -116,7 +109,7 @@ mod tests {
     fn parse_basic_info() {
         let a = parse(["-i"]).unwrap();
         assert!(a.info);
-        assert!(a.path.is_none());
+        assert!(a.paths.is_empty());
         assert!(a.width.is_none());
     }
 
@@ -125,7 +118,7 @@ mod tests {
         let a = parse(["-w", "800", "-q", "80", "img.png"]).unwrap();
         assert_eq!(a.width, Some(800));
         assert_eq!(a.quality, Some(80));
-        assert_eq!(a.path, Some(PathBuf::from("img.png")));
+        assert_eq!(a.paths, vec![PathBuf::from("img.png")]);
     }
 
     #[test]
@@ -184,10 +177,33 @@ mod tests {
     }
 
     #[test]
-    fn parse_too_many_args() {
-        assert!(matches!(
-            parse(["a.png", "b.png"]),
-            Err(ParseError::TooManyArgs(_))
-        ));
+    fn parse_multiple_paths_in_order() {
+        let a = parse(["a.png", "b.png", "c.png"]).unwrap();
+        assert_eq!(
+            a.paths,
+            vec![
+                PathBuf::from("a.png"),
+                PathBuf::from("b.png"),
+                PathBuf::from("c.png")
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_paths_mixed_with_options() {
+        let a = parse(["-w", "800", "a.png", "-i", "b.png"]).unwrap();
+        assert_eq!(a.width, Some(800));
+        assert!(a.info);
+        assert_eq!(
+            a.paths,
+            vec![PathBuf::from("a.png"), PathBuf::from("b.png")]
+        );
+    }
+
+    #[test]
+    fn parse_no_path_is_stdin_mode() {
+        let a = parse(["-i"]).unwrap();
+        assert!(a.info);
+        assert!(a.paths.is_empty());
     }
 }

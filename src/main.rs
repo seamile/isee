@@ -59,33 +59,79 @@ impl fmt::Display for AppErr {
 }
 
 fn run(args: &cli::Args) -> Result<(), AppErr> {
-    let source = match &args.path {
-        Some(p) => input::Source::Path(p.clone()),
-        None => {
-            if detect::is_tty(0) {
-                return Err(AppErr::Usage(
-                    "no image path and stdin is a terminal".into(),
-                ));
-            }
-            input::Source::Stdin
-        }
-    };
+    let sources = build_sources(args)?;
     let stdout = io::stdout();
     if args.info {
-        let info = input::load_info(&source).map_err(|e| AppErr::Fatal(e.to_string()))?;
-        let path = match &source {
-            input::Source::Path(p) => std::fs::canonicalize(p)
-                .map(|x| x.display().to_string())
-                .unwrap_or_else(|_| p.display().to_string()),
-            input::Source::Stdin => "-".to_string(),
-        };
-        print!("{}", info::render(&path, &info));
-        io::stdout()
-            .flush()
-            .map_err(|e| AppErr::Fatal(e.to_string()))?;
-        return Ok(());
+        return run_info(&sources, &stdout);
     }
+    run_preview(&sources, args, &stdout)
+}
 
+/// Build the ordered list of input sources. When no path is supplied the single
+/// source is stdin (after verifying stdin is not a terminal); paths are never
+/// mixed with stdin.
+fn build_sources(args: &cli::Args) -> Result<Vec<input::Source>, AppErr> {
+    if args.paths.is_empty() {
+        if detect::is_tty(0) {
+            return Err(AppErr::Usage(
+                "no image path and stdin is a terminal".into(),
+            ));
+        }
+        Ok(vec![input::Source::Stdin])
+    } else {
+        Ok(args
+            .paths
+            .iter()
+            .map(|p| input::Source::Path(p.clone()))
+            .collect())
+    }
+}
+
+/// The path shown to the user: the exact argument as passed in, so titles and
+/// `-i` listings never rewrite the user's path.
+fn display_source(source: &input::Source) -> String {
+    match source {
+        input::Source::Stdin => "-".to_string(),
+        input::Source::Path(p) => p.display().to_string(),
+    }
+}
+
+fn run_info(sources: &[input::Source], stdout: &io::Stdout) -> Result<(), AppErr> {
+    let multi = sources.len() > 1;
+    let mut out = stdout.lock();
+    let mut wrote_before = false;
+    let mut failed = 0usize;
+    for source in sources {
+        let path = display_source(source);
+        match input::load_info(source) {
+            Ok(info) => {
+                emit_info_item(&mut out, multi, wrote_before, &path, &info)
+                    .map_err(|e| AppErr::Fatal(e.to_string()))?;
+                out.flush().map_err(|e| AppErr::Fatal(e.to_string()))?;
+                wrote_before = true;
+            }
+            Err(e) => {
+                if !multi {
+                    return Err(AppErr::Fatal(e.to_string()));
+                }
+                eprintln!("isee: {path}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        Err(AppErr::Fatal(failure_summary(failed)))
+    } else {
+        Ok(())
+    }
+}
+
+fn run_preview(
+    sources: &[input::Source],
+    args: &cli::Args,
+    stdout: &io::Stdout,
+) -> Result<(), AppErr> {
+    let multi = sources.len() > 1;
     let term = detect::detect(stdout.as_raw_fd());
     let opts = size::RenderOpts {
         width: args.width,
@@ -97,29 +143,224 @@ fn run(args: &cli::Args) -> Result<(), AppErr> {
         Protocol::Kitty => size::kitty_bounds(&opts),
         Protocol::HalfBlocks => size::halfblock_bounds(&opts),
     };
-    let loaded = input::load(&source, &opts, bounds).map_err(|e| AppErr::Fatal(e.to_string()))?;
-    let mut bytes = match term.protocol {
-        Protocol::Kitty => kitty::render(&loaded.img, &opts, kitty::new_image_id()),
-        Protocol::HalfBlocks => halfblock::render(&loaded.img, &opts).into_bytes(),
-    };
-    // Kitty's placement already parks the cursor on the row below the image;
-    // appending a newline here would push the prompt even further down.
-    if !matches!(term.protocol, Protocol::Kitty) {
-        bytes.push(b'\n');
-    }
-    let bytes = if term.tmux && matches!(term.protocol, Protocol::Kitty) {
-        // In tmux only the KGP transfer chunks go through DCS passthrough;
-        // placeholder cells must reach tmux's pane grid so the image lands in
-        // the right pane and survives redraws. HalfBlocks are plain text and
-        // need no passthrough at all.
-        detect::wrap_kitty_passthrough(&bytes)
-    } else {
-        bytes
-    };
 
     let mut out = stdout.lock();
-    out.write_all(&bytes)
-        .map_err(|e| AppErr::Fatal(e.to_string()))?;
-    out.flush().map_err(|e| AppErr::Fatal(e.to_string()))?;
+    let mut wrote_before = false;
+    let mut failed = 0usize;
+    for source in sources {
+        let path = display_source(source);
+        match input::load(source, &opts, bounds) {
+            Ok(loaded) => {
+                let mut block = match term.protocol {
+                    Protocol::Kitty => kitty::render(&loaded.img, &opts, kitty::new_image_id()),
+                    Protocol::HalfBlocks => halfblock::render(&loaded.img, &opts).into_bytes(),
+                };
+                if term.tmux && matches!(term.protocol, Protocol::Kitty) {
+                    block = detect::wrap_kitty_passthrough(&block);
+                }
+                emit_preview_item(&mut out, multi, term.protocol, wrote_before, &path, &block)
+                    .map_err(|e| AppErr::Fatal(e.to_string()))?;
+                out.flush().map_err(|e| AppErr::Fatal(e.to_string()))?;
+                wrote_before = true;
+            }
+            Err(e) => {
+                if !multi {
+                    return Err(AppErr::Fatal(e.to_string()));
+                }
+                eprintln!("isee: {path}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        Err(AppErr::Fatal(failure_summary(failed)))
+    } else {
+        Ok(())
+    }
+}
+
+/// Stream one preview image to `out`, flushing nothing itself. A single image
+/// emits no path title and gives non-Kitty a trailing newline; multiple images
+/// precede each image with its original path and separate it from the previous
+/// one by exactly one blank line. `wrote_before` reflects whether an earlier
+/// image was already emitted, so a failed file never blocks later ones.
+fn emit_preview_item(
+    out: &mut dyn Write,
+    multi: bool,
+    protocol: Protocol,
+    wrote_before: bool,
+    path: &str,
+    block: &[u8],
+) -> io::Result<()> {
+    if multi {
+        if wrote_before {
+            out.write_all(b"\n")?;
+        }
+        out.write_all(path.as_bytes())?;
+        out.write_all(b"\n")?;
+    }
+    out.write_all(block)?;
+    if !multi && !matches!(protocol, Protocol::Kitty) {
+        out.write_all(b"\n")?;
+    }
     Ok(())
+}
+
+/// Stream one `-i` listing to `out`. A single listing keeps the current output;
+/// multiple listings are separated by one blank line.
+fn emit_info_item(
+    out: &mut dyn Write,
+    multi: bool,
+    wrote_before: bool,
+    path: &str,
+    info: &input::ImageInfo,
+) -> io::Result<()> {
+    if multi && wrote_before {
+        out.write_all(b"\n")?;
+    }
+    out.write_all(info::render(path, info).as_bytes())?;
+    Ok(())
+}
+
+fn failure_summary(n: usize) -> String {
+    if n == 1 {
+        "1 image failed".to_string()
+    } else {
+        format!("{n} images failed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn some_info() -> input::ImageInfo {
+        input::ImageInfo {
+            size: 100,
+            width: 10,
+            height: 5,
+            dpi: None,
+            alpha: false,
+            color: image::ColorType::Rgb8,
+        }
+    }
+
+    #[test]
+    fn single_preview_has_no_title() {
+        let mut out = Vec::new();
+        emit_preview_item(&mut out, false, Protocol::Kitty, false, "a.png", b"BLOCK").unwrap();
+        assert_eq!(out, b"BLOCK");
+    }
+
+    #[test]
+    fn single_halfblock_gets_trailing_newline() {
+        let mut out = Vec::new();
+        emit_preview_item(
+            &mut out,
+            false,
+            Protocol::HalfBlocks,
+            false,
+            "a.png",
+            b"BLOCK",
+        )
+        .unwrap();
+        assert_eq!(out, b"BLOCK\n");
+    }
+
+    #[test]
+    fn multi_preview_titles_and_blank_line() {
+        let mut out = Vec::new();
+        emit_preview_item(&mut out, true, Protocol::Kitty, false, "a.png", b"A\r\n").unwrap();
+        emit_preview_item(&mut out, true, Protocol::Kitty, true, "b.png", b"B\r\n").unwrap();
+        assert_eq!(out, b"a.png\nA\r\n\nb.png\nB\r\n");
+    }
+
+    #[test]
+    fn multi_halfblock_no_extra_trailing_newline() {
+        let mut out = Vec::new();
+        emit_preview_item(&mut out, true, Protocol::HalfBlocks, false, "a.png", b"A\n").unwrap();
+        emit_preview_item(&mut out, true, Protocol::HalfBlocks, true, "b.png", b"B\n").unwrap();
+        assert_eq!(out, b"a.png\nA\n\nb.png\nB\n");
+    }
+
+    #[test]
+    fn preview_failure_does_not_block_later_images() {
+        let mut out = Vec::new();
+        let mut wrote_before = false;
+        emit_preview_item(
+            &mut out,
+            true,
+            Protocol::Kitty,
+            wrote_before,
+            "a.png",
+            b"A\r\n",
+        )
+        .unwrap();
+        wrote_before = true;
+        // a failed image emits nothing and leaves wrote_before untouched, so the
+        // next success still gets exactly one separating blank line.
+        emit_preview_item(
+            &mut out,
+            true,
+            Protocol::Kitty,
+            wrote_before,
+            "c.png",
+            b"C\r\n",
+        )
+        .unwrap();
+        assert_eq!(out, b"a.png\nA\r\n\nc.png\nC\r\n");
+        assert!(wrote_before);
+    }
+
+    #[test]
+    fn failure_summary_singular_and_plural() {
+        assert_eq!(failure_summary(1), "1 image failed");
+        assert_eq!(failure_summary(2), "2 images failed");
+    }
+
+    #[test]
+    fn info_single_matches_render() {
+        let mut out = Vec::new();
+        emit_info_item(&mut out, false, false, "a.png", &some_info()).unwrap();
+        assert_eq!(out, info::render("a.png", &some_info()).as_bytes());
+    }
+
+    #[test]
+    fn info_multi_separates_blocks() {
+        let mut out = Vec::new();
+        emit_info_item(&mut out, true, false, "a.png", &some_info()).unwrap();
+        emit_info_item(&mut out, true, true, "b.png", &some_info()).unwrap();
+        let expected = format!(
+            "{}\n{}",
+            info::render("a.png", &some_info()),
+            info::render("b.png", &some_info())
+        );
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn info_failure_leaves_gap_for_later() {
+        let mut out = Vec::new();
+        let mut wrote_before = false;
+        emit_info_item(&mut out, true, wrote_before, "a.png", &some_info()).unwrap();
+        wrote_before = true;
+        emit_info_item(&mut out, true, wrote_before, "b.png", &some_info()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{}\n{}",
+                info::render("a.png", &some_info()),
+                info::render("b.png", &some_info())
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn display_source_raw_and_stdin() {
+        let src = input::Source::Path(PathBuf::from("foo//bar.png"));
+        assert_eq!(display_source(&src), "foo//bar.png");
+        assert_eq!(display_source(&input::Source::Stdin), "-");
+    }
 }
