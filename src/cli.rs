@@ -75,7 +75,9 @@ where
                 let v = it.next().ok_or(ParseError::MissingValue("-q"))?;
                 out.quality = Some(parse_quality(&v)?);
             }
-            s if s.starts_with('-') && s.len() > 1 => return Err(ParseError::UnknownOption(s.to_string())),
+            s if s.starts_with('-') && s.len() > 1 => {
+                return Err(ParseError::UnknownOption(s.to_string()));
+            }
             s => {
                 if out.path.is_some() {
                     return Err(ParseError::TooManyArgs(s.to_string()));
@@ -163,17 +165,29 @@ mod tests {
 
     #[test]
     fn parse_invalid_number() {
-        assert!(matches!(parse(["-w", "abc"]), Err(ParseError::InvalidNumber(..))));
+        assert!(matches!(
+            parse(["-w", "abc"]),
+            Err(ParseError::InvalidNumber(..))
+        ));
     }
 
     #[test]
     fn parse_quality_range() {
-        assert!(matches!(parse(["-q", "101"]), Err(ParseError::InvalidNumber(..))));
-        assert!(matches!(parse(["-q", "-1"]), Err(ParseError::InvalidNumber(..))));
+        assert!(matches!(
+            parse(["-q", "101"]),
+            Err(ParseError::InvalidNumber(..))
+        ));
+        assert!(matches!(
+            parse(["-q", "-1"]),
+            Err(ParseError::InvalidNumber(..))
+        ));
     }
 
     #[test]
     fn parse_too_many_args() {
-        assert!(matches!(parse(["a.png", "b.png"]), Err(ParseError::TooManyArgs(_))));
+        assert!(matches!(
+            parse(["a.png", "b.png"]),
+            Err(ParseError::TooManyArgs(_))
+        ));
     }
 }

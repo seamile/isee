@@ -74,7 +74,9 @@ fn parse_iccp(payload: &[u8]) -> Option<String> {
     }
     rest = tail;
     let mut out = Vec::new();
-    flate2::read::ZlibDecoder::new(rest).read_to_end(&mut out).ok()?;
+    flate2::read::ZlibDecoder::new(rest)
+        .read_to_end(&mut out)
+        .ok()?;
     icc_desc(&out)
 }
 
@@ -107,10 +109,7 @@ fn jpeg(data: &[u8], m: &mut Meta) {
                 }
             }
             0xE1 => {
-                if let Some(dpi) = payload
-                    .strip_prefix(b"Exif\0\0")
-                    .and_then(exif_xres)
-                {
+                if let Some(dpi) = payload.strip_prefix(b"Exif\0\0").and_then(exif_xres) {
                     m.dpi = Some(dpi);
                 }
             }
@@ -277,7 +276,9 @@ fn gif(data: &[u8], m: &mut Meta) {
                 pos = skip_sub_blocks(data, pos);
             }
             0x2C => {
-                let Some(desc) = data.get(pos..pos + 9) else { break };
+                let Some(desc) = data.get(pos..pos + 9) else {
+                    break;
+                };
                 let lflags = desc[8];
                 pos += 9;
                 if lflags & 0x80 != 0 {
@@ -293,7 +294,9 @@ fn gif(data: &[u8], m: &mut Meta) {
 
 fn skip_sub_blocks(data: &[u8], mut pos: usize) -> usize {
     loop {
-        let Some(&len) = data.get(pos) else { return pos };
+        let Some(&len) = data.get(pos) else {
+            return pos;
+        };
         pos += 1;
         if len == 0 {
             return pos;
@@ -537,10 +540,15 @@ mod tests {
             d.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02]);
             d
         }
-        assert_eq!(extract(&build_exif(true, 1_440_000, 10_000, 2)).dpi, Some(144.0));
+        assert_eq!(
+            extract(&build_exif(true, 1_440_000, 10_000, 2)).dpi,
+            Some(144.0)
+        );
         let expect = (100.0f64 / 39.0 * 2.54 * 100.0).round();
         assert_eq!(
-            extract(&build_exif(false, 100, 39, 3)).dpi.map(|v| (v * 100.0).round()),
+            extract(&build_exif(false, 100, 39, 3))
+                .dpi
+                .map(|v| (v * 100.0).round()),
             Some(expect)
         );
     }
@@ -589,7 +597,9 @@ mod tests {
         let mut d = b"GIF89a".to_vec();
         d.extend_from_slice(&[1, 0, 1, 0, 0, 0, 0]); // LSD, no GCT
         d.extend_from_slice(&[0x21, 0xF9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00]); // GCE transparent=1
-        d.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00]);
+        d.extend_from_slice(&[
+            0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00,
+        ]);
         d.push(0x3B);
         let m = extract(&d);
         assert!(m.alpha_hint);
@@ -666,4 +676,3 @@ mod tests {
         assert!(!m.alpha_hint);
     }
 }
-

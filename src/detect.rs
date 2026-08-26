@@ -89,7 +89,13 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
     if env::var("ISEE_DEBUG").is_ok() {
         eprintln!(
             "isee: protocol={:?} cell={}x{} win={}x{} px={:?} tmux={}",
-            info.protocol, info.cell.w, info.cell.h, info.win.cols, info.win.rows, info.win.px, tmux
+            info.protocol,
+            info.cell.w,
+            info.cell.h,
+            info.win.cols,
+            info.win.rows,
+            info.win.px,
+            tmux
         );
     }
     info
@@ -118,11 +124,19 @@ fn env_kitty_hint() -> bool {
     if env::var("WEZTERM_EXECUTABLE").is_ok() {
         return true;
     }
-    match env::var("TERM_PROGRAM").unwrap_or_default().to_ascii_lowercase().as_str() {
+    match env::var("TERM_PROGRAM")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "ghostty" | "wezterm" | "rio" | "kitty" => return true,
         _ => {}
     }
-    match env::var("TERM").unwrap_or_default().to_ascii_lowercase().as_str() {
+    match env::var("TERM")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "xterm-kitty" | "xterm-ghostty" | "ghostty" | "wezterm" | "rio" | "kitty" => return true,
         _ => {}
     }
@@ -130,7 +144,11 @@ fn env_kitty_hint() -> bool {
 }
 
 fn fallback_cell() -> CellPx {
-    match env::var("TERM_PROGRAM").unwrap_or_default().to_ascii_lowercase().as_str() {
+    match env::var("TERM_PROGRAM")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "ghostty" => CellPx { w: 9, h: 18 },
         "wezterm" | "rio" => CellPx { w: 8, h: 16 },
         _ => CellPx { w: 7, h: 14 },
@@ -173,16 +191,16 @@ fn enable_tmux_passthrough() {
             .status()
             .is_ok()
     };
-    quiet(
-        Command::new("tmux").args(["set", "-p", "allow-passthrough", "all"]),
-    );
-    quiet(
-        Command::new("tmux").args(["set", "-s", "input-buffer-size", "104857600"]),
-    );
+    quiet(Command::new("tmux").args(["set", "-p", "allow-passthrough", "all"]));
+    quiet(Command::new("tmux").args(["set", "-s", "input-buffer-size", "104857600"]));
 }
 
 fn write_probe(tty: &mut RawTty, seq: &[u8], passthrough: bool) -> bool {
-    let out = if passthrough { wrap_passthrough(seq) } else { seq.to_vec() };
+    let out = if passthrough {
+        wrap_passthrough(seq)
+    } else {
+        seq.to_vec()
+    };
     tty.file.write_all(&out).is_ok()
 }
 
@@ -295,13 +313,11 @@ fn read_until(tty: &mut RawTty, term: &[u8], timeout: Duration) -> ProbeRead {
         if elapsed >= timeout {
             return ProbeRead::Timeout(std::mem::take(&mut tty.pending));
         }
-        let remain =
-            (timeout - elapsed).as_millis().min(i32::MAX as u128) as i32;
+        let remain = (timeout - elapsed).as_millis().min(i32::MAX as u128) as i32;
         if !wait_readable(fd, remain) {
             return ProbeRead::Timeout(std::mem::take(&mut tty.pending));
         }
-        let n =
-            unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
+        let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
         if n > 0 {
             tty.pending.extend_from_slice(&tmp[..n as usize]);
             if tty.pending.len() >= MAX_RESPONSE {
@@ -342,7 +358,11 @@ struct RawTty {
 
 impl RawTty {
     fn new() -> Option<Self> {
-        let file = OpenOptions::new().read(true).write(true).open("/dev/tty").ok()?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .ok()?;
         let fd = file.as_raw_fd();
         let mut orig: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
@@ -355,7 +375,12 @@ impl RawTty {
         }
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        Some(RawTty { file, orig, raw: true, pending: Vec::new() })
+        Some(RawTty {
+            file,
+            orig,
+            raw: true,
+            pending: Vec::new(),
+        })
     }
 }
 
@@ -419,8 +444,14 @@ mod tests {
 
     #[test]
     fn csi_t_parse_cell_px_format() {
-        assert_eq!(parse_csi_t(b"\x1b[6;1080;1920t"), Some(CellPx { w: 1920, h: 1080 }));
-        assert_eq!(parse_csi_t(b"junk\x1b[6;36;40t"), Some(CellPx { w: 40, h: 36 }));
+        assert_eq!(
+            parse_csi_t(b"\x1b[6;1080;1920t"),
+            Some(CellPx { w: 1920, h: 1080 })
+        );
+        assert_eq!(
+            parse_csi_t(b"junk\x1b[6;36;40t"),
+            Some(CellPx { w: 40, h: 36 })
+        );
         assert_eq!(parse_csi_t(b"\x1b[6;0;0t"), None);
     }
 

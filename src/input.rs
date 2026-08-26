@@ -25,16 +25,69 @@ fn read_all(source: &Source) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Maximum single edge (width or height) allowed for a regular preview decode.
+const PREVIEW_MAX_DIMENSION: u32 = 12_000;
+/// Maximum bytes a single preview allocation may reserve.
+const PREVIEW_MAX_ALLOC: u64 = 128 * 1024 * 1024;
+/// Maximum pixel count allowed when rasterizing an SVG preview.
+const SVG_MAX_PIXELS: u64 = 16 * 1024 * 1024;
+
+/// `image` decode limits guarding the interactive preview. The `-i` info path
+/// (`load_info`) and the JPEG DCT downscale path are intentionally excluded:
+/// the DCT path reads only the header before shrinking, and `-i` must still
+/// report the metadata of enormous images.
+fn preview_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(PREVIEW_MAX_DIMENSION);
+    limits.max_image_height = Some(PREVIEW_MAX_DIMENSION);
+    limits.max_alloc = Some(PREVIEW_MAX_ALLOC);
+    limits
+}
+
+fn preview_size_error(w: u32, h: u32) -> Box<dyn std::error::Error> {
+    format!("image exceeds the preview size limit ({w}x{h}, max {PREVIEW_MAX_DIMENSION}px a side)")
+        .into()
+}
+
+fn preview_alloc_error(w: u32, h: u32) -> Box<dyn std::error::Error> {
+    format!(
+        "image exceeds the preview memory limit ({w}x{h} needs more than {PREVIEW_MAX_ALLOC} bytes)"
+    )
+    .into()
+}
+
+/// Reject a regular full decode whose dimensions exceed `PREVIEW_MAX_DIMENSION`.
+fn check_preview_size(w: u32, h: u32) -> Result<(), Box<dyn std::error::Error>> {
+    if w > PREVIEW_MAX_DIMENSION || h > PREVIEW_MAX_DIMENSION {
+        return Err(preview_size_error(w, h));
+    }
+    Ok(())
+}
+
+/// Reject a regular full decode whose decoded buffer would exceed
+/// `PREVIEW_MAX_ALLOC`. `image::Limits::max_alloc` is enforced by some decoders
+/// but not the top-level output buffer allocation, so this is the reliable cap.
+fn check_preview_alloc(w: u32, h: u32, bytes: u64) -> Result<(), Box<dyn std::error::Error>> {
+    if bytes > PREVIEW_MAX_ALLOC {
+        return Err(preview_alloc_error(w, h));
+    }
+    Ok(())
+}
+
 fn decode_full(buf: &[u8]) -> Result<(DynamicImage, ColorType), Box<dyn std::error::Error>> {
     if is_svg(buf) {
         let img = decode_svg(buf)?;
         let color = img.color();
         return Ok((img, color));
     }
-    let reader = ImageReader::new(Cursor::new(buf)).with_guessed_format()?;
+    let mut reader = ImageReader::new(Cursor::new(buf)).with_guessed_format()?;
+    reader.limits(preview_limits());
     let mut decoder = reader.into_decoder()?;
     let color = decoder.color_type();
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let (w, h) = decoder.dimensions();
+    check_preview_size(w, h)?;
+    check_preview_alloc(w, h, decoder.total_bytes())?;
     let mut img = DynamicImage::from_decoder(decoder)?;
     img.apply_orientation(orientation);
     Ok((img, color))
@@ -290,11 +343,28 @@ fn core_font_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
+/// Reject an SVG whose rasterized pixel area exceeds `SVG_MAX_PIXELS`, using
+/// overflow-safe multiplication so a pathological declared size cannot wrap.
+/// The `resvg` pixmap allocation is outside `image::Limits`, so this must run
+/// before `Pixmap::new` rather than relying on the decode reader limits.
+fn check_svg_size(w: u32, h: u32) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(pixels) = u64::from(w).checked_mul(u64::from(h))
+        && pixels <= SVG_MAX_PIXELS
+    {
+        return Ok(());
+    }
+    Err(
+        format!("SVG exceeds the preview pixel limit ({w}x{h}, max {SVG_MAX_PIXELS} pixels)")
+            .into(),
+    )
+}
+
 fn decode_svg(buf: &[u8]) -> Result<DynamicImage, Box<dyn std::error::Error>> {
     let tree = resvg::usvg::Tree::from_data(buf, &svg_options())?;
     let size = tree.size();
     let width = size.width().ceil().max(1.0) as u32;
     let height = size.height().ceil().max(1.0) as u32;
+    check_svg_size(width, height)?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
         .ok_or_else(|| "could not allocate an SVG pixmap".to_string())?;
     resvg::render(
@@ -569,5 +639,107 @@ mod tests {
             .unwrap();
         let full = decode_for_preview(&png, &o, bounds).unwrap();
         assert_eq!((full.width(), full.height()), (1200, 600));
+    }
+
+    #[test]
+    fn check_preview_size_accepts_within_limit() {
+        assert!(check_preview_size(12000, 9000).is_ok());
+        assert!(check_preview_size(1, 1).is_ok());
+        assert!(check_preview_size(12000, 12000).is_ok());
+    }
+
+    #[test]
+    fn check_preview_size_rejects_over_dimension() {
+        assert!(check_preview_size(12001, 10).is_err());
+        assert!(check_preview_size(10, 12001).is_err());
+        let err = check_preview_size(12001, 10).unwrap_err().to_string();
+        assert!(err.contains("preview size limit"), "got {err}");
+    }
+
+    #[test]
+    fn check_preview_alloc_rejects_over_memory() {
+        assert!(check_preview_alloc(100, 100, 100 * 100 * 4).is_ok());
+        assert!(check_preview_alloc(12000, 12000, PREVIEW_MAX_ALLOC).is_ok());
+        let err = check_preview_alloc(12000, 12000, PREVIEW_MAX_ALLOC + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("preview memory limit"), "got {err}");
+    }
+
+    #[test]
+    fn check_svg_size_accepts_within_pixel_limit() {
+        assert!(check_svg_size(4000, 4000).is_ok());
+        assert!(check_svg_size(4096, 4096).is_ok());
+    }
+
+    #[test]
+    fn check_svg_size_rejects_over_pixel_limit() {
+        assert!(check_svg_size(4097, 4097).is_err());
+        assert!(check_svg_size(u32::MAX, u32::MAX).is_err());
+        let err = check_svg_size(4097, 4097).unwrap_err().to_string();
+        assert!(err.contains("preview pixel limit"), "got {err}");
+    }
+
+    fn svg_of_size(w: u32, h: u32) -> Vec<u8> {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}"><rect width="{w}" height="{h}" fill="red"/></svg>"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn svg_below_pixel_limit_still_decodes() {
+        let img = decode_svg(&svg_of_size(200, 200)).unwrap();
+        assert_eq!((img.width(), img.height()), (200, 200));
+    }
+
+    #[test]
+    fn svg_over_pixel_limit_rejected_before_raster() {
+        let err = decode_svg(&svg_of_size(5000, 5000))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("preview pixel limit"), "got {err}");
+    }
+
+    #[test]
+    fn decode_full_rejects_png_over_dimension_limit() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(12001, 10))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let err = decode_full(&png).unwrap_err().to_string();
+        assert!(err.contains("limit"), "got {err}");
+    }
+
+    #[test]
+    fn decode_full_rejects_over_dimension_jpeg() {
+        let jpeg = encode_jpeg(12001, 10);
+        let err = decode_full(&jpeg).unwrap_err().to_string();
+        assert!(err.contains("limit"), "got {err}");
+    }
+
+    #[test]
+    fn jpeg_dct_scales_raw_source_over_dimension_limit() {
+        let jpeg = encode_jpeg(12001, 60);
+        let o = opts_width(Some(240));
+        let bounds = (100_000u64, 100_000u64);
+        let img = decode_jpeg_scaled(&jpeg, &o, bounds)
+            .unwrap()
+            .expect("DCT must scale an oversized JPEG");
+        assert!(img.width() < 12001, "DCT must not keep full width");
+        assert!(img.width() >= 240 && img.height() >= 1);
+        assert!(decode_for_preview(&jpeg, &o, bounds).is_ok());
+    }
+
+    #[test]
+    fn load_info_ignores_preview_dimension_limit() {
+        let jpeg = encode_jpeg(12001, 60);
+        let path = std::env::temp_dir().join(format!("isee_load_info_{}.jpg", std::process::id()));
+        std::fs::write(&path, &jpeg).unwrap();
+        let info = load_info(&Source::Path(path.clone())).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(info.width, 12001);
+        assert_eq!(info.height, 60);
+        assert_eq!(info.size, jpeg.len() as u64);
     }
 }

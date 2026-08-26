@@ -42,7 +42,9 @@ fn source_rgb32f() -> DynamicImage {
 fn image_for(format: ImageFormat) -> DynamicImage {
     match format {
         ImageFormat::Jpeg => DynamicImage::ImageRgba8(source_image()).into_rgb8().into(),
-        ImageFormat::Farbfeld => DynamicImage::ImageRgba8(source_image()).into_rgba16().into(),
+        ImageFormat::Farbfeld => DynamicImage::ImageRgba8(source_image())
+            .into_rgba16()
+            .into(),
         ImageFormat::Hdr | ImageFormat::OpenExr => source_rgb32f(),
         _ => DynamicImage::ImageRgba8(source_image()),
     }
