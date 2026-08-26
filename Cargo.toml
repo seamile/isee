@@ -22,6 +22,7 @@ image  = { version = "0.25", default-features = false, features = [
 ] }
 libc   = "0.2"
 flate2 = "1"
+resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts", "raster-images", "svgz"] }
 
 [profile.release]
 opt-level = 3

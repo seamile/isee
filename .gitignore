@@ -21,6 +21,7 @@ debug/
 .codegraph/
 .DS_Store
 .kilo/
+.kilocodeignore
 .omo/
 AGENTS.md
 misc/

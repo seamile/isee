@@ -28,14 +28,16 @@ If `IMGPATH` is omitted, image data is read from `stdin`.
 
 ## Supported formats
 
-`isee` decodes the following formats (all via the Rust `image` crate):
+`isee` decodes the following formats. Raster formats go through the Rust
+`image` crate; SVG is rasterized with the pure-Rust `resvg`, including gzipped
+`.svgz`:
 
 PNG, JPEG, GIF, WebP, BMP, PNM (PBM/PGM/PPM), QOI, Farbfeld, ICO, TIFF,
-Radiance HDR, OpenEXR
+Radiance HDR, OpenEXR, SVG
 
-Not supported: SVG, JPEG2000, and HEIC need external rasterizers/decoders
-outside the `image` crate; TGA is not content-detectable by `image`, and pure
-Rust AVIF support is encoder-only, so neither renders in `isee`.
+Not supported: JPEG2000 and HEIC need external rasterizers/decoders outside
+the `image` crate; TGA is not content-detectable by `image`, and pure Rust
+AVIF support is encoder-only, so neither renders in `isee`.
 
 ## Examples
 
