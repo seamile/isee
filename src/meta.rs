@@ -21,6 +21,10 @@ pub fn extract(data: &[u8]) -> Meta {
         webp(data, &mut meta);
     } else if data.len() >= 6 && (&data[..6] == b"GIF89a" || &data[..6] == b"GIF87a") {
         gif(data, &mut meta);
+    } else if data.len() >= 4 && (&data[..2] == b"II" || &data[..2] == b"MM") {
+        tiff(data, &mut meta);
+    } else if data.len() >= 2 && &data[..2] == b"BM" {
+        bmp(data, &mut meta);
     }
     meta
 }
@@ -298,6 +302,30 @@ fn skip_sub_blocks(data: &[u8], mut pos: usize) -> usize {
     }
 }
 
+// ---------- TIFF ----------
+
+fn tiff(data: &[u8], m: &mut Meta) {
+    m.dpi = exif_xres(data);
+}
+
+// ---------- BMP ----------
+
+fn bmp(data: &[u8], m: &mut Meta) {
+    if data.len() < 46 {
+        return;
+    }
+    let hdr = le32(data, 14) as usize;
+    if hdr < 40 {
+        return;
+    }
+    let xppm = le32(data, 38);
+    let yppm = le32(data, 42);
+    let ppm = if xppm != 0 { xppm } else { yppm };
+    if ppm != 0 {
+        m.dpi = Some(ppm as f64 * 0.0254);
+    }
+}
+
 // ---------- ICC ----------
 
 /// Pull the human-readable description out of an ICC profile
@@ -382,6 +410,14 @@ mod tests {
 
     fn push_u32(v: &mut Vec<u8>, x: u32) {
         v.extend_from_slice(&x.to_be_bytes());
+    }
+
+    fn push_u16_le(v: &mut Vec<u8>, x: u16) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+
+    fn push_u32_le(v: &mut Vec<u8>, x: u32) {
+        v.extend_from_slice(&x.to_le_bytes());
     }
 
     fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) {
@@ -569,6 +605,57 @@ mod tests {
         d.extend_from_slice(&[0xFE, 0x03, b'a', b'b', b'c', 0x00]); // comment ext
         d.push(0x3B);
         assert!(!extract(&d).alpha_hint); // walked to end without crash
+    }
+
+    #[test]
+    fn tiff_resolution_dpi() {
+        let mut ifd: Vec<u8> = Vec::new();
+        push_u16(&mut ifd, 2); // entries
+
+        push_u16(&mut ifd, 282); // XResolution
+        push_u16(&mut ifd, 5); // RATIONAL
+        push_u32(&mut ifd, 1);
+        push_u32(&mut ifd, 38); // offset of rational data
+
+        push_u16(&mut ifd, 296); // ResolutionUnit
+        push_u16(&mut ifd, 3); // SHORT
+        push_u32(&mut ifd, 1);
+        push_u16(&mut ifd, 2); // inch
+        push_u16(&mut ifd, 0);
+
+        push_u32(&mut ifd, 0); // next IFD
+        push_u32(&mut ifd, 300); // xres num
+        push_u32(&mut ifd, 1); // xres den
+
+        let mut d = b"MM".to_vec();
+        push_u16(&mut d, 42);
+        push_u32(&mut d, 8);
+        d.extend_from_slice(&ifd);
+
+        let m = extract(&d);
+        assert_eq!(m.dpi, Some(300.0));
+    }
+
+    #[test]
+    fn bmp_pixels_per_meter_dpi() {
+        let mut d = b"BM".to_vec();
+        push_u32_le(&mut d, 54); // file size
+        push_u32_le(&mut d, 0); // reserved
+        push_u32_le(&mut d, 54); // pixel data offset
+        push_u32_le(&mut d, 40); // DIB header size
+        push_u32_le(&mut d, 1); // width
+        push_u32_le(&mut d, 1); // height
+        push_u16_le(&mut d, 1); // planes
+        push_u16_le(&mut d, 24); // bpp
+        push_u32_le(&mut d, 0); // compression
+        push_u32_le(&mut d, 3); // image size
+        push_u32_le(&mut d, 2835); // x ppm (72 dpi)
+        push_u32_le(&mut d, 2835); // y ppm
+        push_u32_le(&mut d, 0); // colors
+        push_u32_le(&mut d, 0); // important colors
+
+        let m = extract(&d);
+        assert!((m.dpi.unwrap() - 2835f64 * 0.0254).abs() < 0.01);
     }
 
     #[test]

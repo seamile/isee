@@ -2,6 +2,10 @@ use image::ColorType;
 
 use crate::input::ImageInfo;
 
+// macOS Preview falls back to 72 dpi when an image carries no resolution
+// metadata; mirror that default in the info listing.
+const DEFAULT_DPI: u64 = 72;
+
 pub fn render(path: &str, l: &ImageInfo) -> String {
     let mut s = format!("{path}:\n");
     s.push_str(&line("Size", &human_size(l.size)));
@@ -10,10 +14,10 @@ pub fn render(path: &str, l: &ImageInfo) -> String {
     s.push('\n');
     s.push_str(&line("Height", &format!("{} px", l.height)));
     s.push('\n');
-    let dpi = match l.dpi {
-        Some(d) => (d.round() as u64).to_string(),
-        None => "-".to_string(),
-    };
+    let dpi = l
+        .dpi
+        .map(|d| (d.round() as u64).to_string())
+        .unwrap_or_else(|| DEFAULT_DPI.to_string());
     s.push_str(&line("DPI", &dpi));
     s.push('\n');
     s.push_str(&line("Mode", mode_name(l.color)));
@@ -98,10 +102,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_dpi_rendered_as_dash() {
+    fn unknown_dpi_renders_default_72() {
         let mut i = info();
         i.dpi = None;
-        assert!(render("/x.png", &i).contains("- DPI:    -\n"));
+        assert!(render("/x.png", &i).contains("- DPI:    72\n"));
     }
 
     #[test]
