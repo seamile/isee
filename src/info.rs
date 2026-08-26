@@ -16,8 +16,8 @@ pub fn render(path: &str, l: &ImageInfo) -> String {
     s.push('\n');
     let dpi = l
         .dpi
-        .map(|d| (d.round() as u64).to_string())
-        .unwrap_or_else(|| DEFAULT_DPI.to_string());
+        .map(|d| format!("{} ppi", d.round() as u64))
+        .unwrap_or_else(|| format!("{DEFAULT_DPI} ppi"));
     s.push_str(&line("DPI", &dpi));
     s.push('\n');
     s.push_str(&line("Mode", mode_name(l.color)));
@@ -82,7 +82,7 @@ mod tests {
              - Size:   1.3 MB\n\
              - Width:  800 px\n\
              - Height: 600 px\n\
-             - DPI:    144\n\
+             - DPI:    144 ppi\n\
              - Mode:   RGB\n\
              - Alpha:  True\n"
         );
@@ -97,7 +97,7 @@ mod tests {
     fn dpi_rounded_to_integer_for_display_only() {
         let mut i = info();
         i.dpi = Some(143.6);
-        assert!(render("/x.png", &i).contains("- DPI:    144\n"));
+        assert!(render("/x.png", &i).contains("- DPI:    144 ppi\n"));
         assert!((i.dpi.unwrap() - 143.6).abs() < f64::EPSILON);
     }
 
@@ -105,7 +105,7 @@ mod tests {
     fn unknown_dpi_renders_default_72() {
         let mut i = info();
         i.dpi = None;
-        assert!(render("/x.png", &i).contains("- DPI:    72\n"));
+        assert!(render("/x.png", &i).contains("- DPI:    72 ppi\n"));
     }
 
     #[test]
