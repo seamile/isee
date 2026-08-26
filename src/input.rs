@@ -64,11 +64,67 @@ fn is_svg(buf: &[u8]) -> bool {
 /// font directories so SVG text renders instead of vanishing.
 fn svg_options() -> resvg::usvg::Options<'static> {
     let mut opt = resvg::usvg::Options::default();
-    let db = opt.fontdb_mut();
-    for dir in core_font_dirs() {
-        db.load_fonts_dir(dir);
+    let fallback = {
+        let db = opt.fontdb_mut();
+        for dir in core_font_dirs() {
+            db.load_fonts_dir(dir);
+        }
+        // usvg's default `font_family` is "Times New Roman" and fontdb's generic
+        // families resolve to MS core fonts, neither of which exist on many Linux
+        // distros. A `<text>` with no `font-family` is parsed as a literal
+        // `Family::Named` (that default), so if it can't be resolved resvg silently
+        // drops every glyph. Substitute a real family present in the loaded set.
+        let family = resolve_default_family(db);
+        if let Some(name) = &family {
+            db.set_sans_serif_family(name.clone());
+            db.set_serif_family(name.clone());
+        }
+        family
+    };
+    if let Some(name) = fallback {
+        opt.font_family = name;
     }
     opt
+}
+
+/// Returns `None` when the built-in default family (`"Times New Roman"`) actually
+/// resolves to a loaded face, preserving out-of-the-box behavior on systems that
+/// ship it. Otherwise picks a real family that does, so an unqualified `<text>`
+/// never silently vanishes.
+fn resolve_default_family(db: &resvg::usvg::fontdb::Database) -> Option<String> {
+    if has_family(db, "Times New Roman") {
+        return None;
+    }
+    // Common Latin sans faces found on headless Linux/CI images.
+    const CANDIDATES: &[&str] = &[
+        "DejaVu Sans",
+        "Noto Sans",
+        "Liberation Sans",
+        "FreeSans",
+        "Arial",
+        "Helvetica",
+        "Verdana",
+        "Tahoma",
+    ];
+    for name in CANDIDATES {
+        if has_family(db, name) {
+            return Some((*name).to_string());
+        }
+    }
+    // Last resort: any regular, non-monospace face the database actually loaded.
+    db.faces()
+        .find(|f| f.style == resvg::usvg::fontdb::Style::Normal && !f.monospaced)
+        .and_then(|f| f.families.first().map(|(family, _)| family.clone()))
+}
+
+fn has_family(db: &resvg::usvg::fontdb::Database, name: &str) -> bool {
+    db.query(&resvg::usvg::fontdb::Query {
+        families: &[resvg::usvg::fontdb::Family::Name(name)],
+        weight: resvg::usvg::fontdb::Weight::NORMAL,
+        stretch: resvg::usvg::fontdb::Stretch::Normal,
+        style: resvg::usvg::fontdb::Style::Normal,
+    })
+    .is_some()
 }
 
 /// `fontdb::load_system_fonts()` scans every font the OS knows about — on macOS
