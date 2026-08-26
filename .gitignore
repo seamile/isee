@@ -19,6 +19,7 @@ debug/
 
 # Customs
 .codegraph/
+.DS_Store
 .kilo/
 .omo/
 AGENTS.md

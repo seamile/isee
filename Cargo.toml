@@ -15,6 +15,10 @@ name = "isee"
 path = "src/main.rs"
 
 [dependencies]
-image  = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image  = { version = "0.25", default-features = false, features = [
+    "png", "jpeg", "gif", "webp",
+    "bmp", "pnm", "qoi", "ff", "ico",
+    "tiff", "hdr", "exr",
+] }
 libc   = "0.2"
 flate2 = "1"
