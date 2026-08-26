@@ -4,8 +4,10 @@ use std::path::PathBuf;
 
 use image::metadata::Orientation;
 use image::{ColorType, DynamicImage, ImageDecoder, ImageReader};
+use jpeg_decoder::PixelFormat;
 
 use crate::meta;
+use crate::size::{self, RenderOpts};
 
 pub enum Source {
     Path(PathBuf),
@@ -23,7 +25,7 @@ fn read_all(source: &Source) -> io::Result<Vec<u8>> {
     }
 }
 
-fn decode_bytes(buf: &[u8]) -> Result<(DynamicImage, ColorType), Box<dyn std::error::Error>> {
+fn decode_full(buf: &[u8]) -> Result<(DynamicImage, ColorType), Box<dyn std::error::Error>> {
     if is_svg(buf) {
         let img = decode_svg(buf)?;
         let color = img.color();
@@ -36,6 +38,138 @@ fn decode_bytes(buf: &[u8]) -> Result<(DynamicImage, ColorType), Box<dyn std::er
     let mut img = DynamicImage::from_decoder(decoder)?;
     img.apply_orientation(orientation);
     Ok((img, color))
+}
+
+/// Decode for the interactive preview. SVG is rasterized as-is; JPEGs whose
+/// source is much larger than the preview target are downsampled during DCT
+/// decoding (`jpeg-decoder`), avoiding a full-resolution raster and the
+/// resulting peak memory. Everything else, and any JPEG the DCT path declines,
+/// falls through to the regular `image` reader.
+fn decode_for_preview(
+    buf: &[u8],
+    opts: &RenderOpts,
+    bounds: (u64, u64),
+) -> Result<DynamicImage, Box<dyn std::error::Error>> {
+    if is_svg(buf) {
+        return decode_svg(buf);
+    }
+    if is_jpeg(buf)
+        && let Some(img) = decode_jpeg_scaled(buf, opts, bounds)?
+    {
+        return Ok(img);
+    }
+    let (img, _) = decode_full(buf)?;
+    Ok(img)
+}
+
+fn is_jpeg(buf: &[u8]) -> bool {
+    buf.len() >= 2 && buf[0] == 0xFF && buf[1] == 0xD8
+}
+
+/// Decode a JPEG with DCT downscaling when it is much larger than the preview
+/// target. Returns `None` (so the caller falls back to the regular decoder)
+/// for unsupported pixel formats, small / already-fitting images, or any
+/// parse/scale/decode failure.
+fn decode_jpeg_scaled(
+    buf: &[u8],
+    opts: &RenderOpts,
+    bounds: (u64, u64),
+) -> Result<Option<DynamicImage>, Box<dyn std::error::Error>> {
+    let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(buf));
+    if decoder.read_info().is_err() {
+        return Ok(None);
+    }
+    let Some(info) = decoder.info() else {
+        return Ok(None);
+    };
+    if !matches!(info.pixel_format, PixelFormat::RGB24 | PixelFormat::L8) {
+        return Ok(None);
+    }
+    let raw_w = info.width as u32;
+    let raw_h = info.height as u32;
+    let orientation = read_orientation(buf);
+    let (ow, oh) = oriented_dims(raw_w, raw_h, orientation);
+    let (tw, th) = size::target_dims(ow, oh, opts, bounds);
+    // Only bother when the preview is meaningfully smaller than the source.
+    if tw >= ow && th >= oh {
+        return Ok(None);
+    }
+    // Request is expressed against the RAW (stored) grid, preserving its aspect
+    // ratio so jpeg-decoder's `||` scale selection is equivalent to `&&`.
+    let (req_w, req_h) = oriented_request(tw, th, orientation);
+    let req_w = req_w.clamp(1, u16::MAX as u32) as u16;
+    let req_h = req_h.clamp(1, u16::MAX as u32) as u16;
+    let (aw, ah) = match decoder.scale(req_w, req_h) {
+        Ok(dims) => dims,
+        Err(_) => return Ok(None),
+    };
+    if aw as u32 >= raw_w && ah as u32 >= raw_h {
+        // No real DCT reduction (the target is close to the source size);
+        // skip so the regular decoder does the exact work.
+        return Ok(None);
+    }
+    let pixels = match decoder.decode() {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    Ok(
+        match build_scaled_image(pixels, info.pixel_format, aw, ah) {
+            Some(mut img) => {
+                img.apply_orientation(orientation);
+                Some(img)
+            }
+            None => None,
+        },
+    )
+}
+
+/// Read the EXIF orientation from the JPEG header only (no full decode) so the
+/// target can be computed from the displayed dimensions before scaling.
+fn read_orientation(buf: &[u8]) -> Orientation {
+    let Ok(reader) = ImageReader::new(Cursor::new(buf)).with_guessed_format() else {
+        return Orientation::NoTransforms;
+    };
+    let Ok(mut decoder) = reader.into_decoder() else {
+        return Orientation::NoTransforms;
+    };
+    decoder.orientation().unwrap_or(Orientation::NoTransforms)
+}
+
+/// Displayed (oriented) dimensions given the stored raw size and orientation.
+fn oriented_dims(w: u32, h: u32, o: Orientation) -> (u32, u32) {
+    match o {
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Rotate90FlipH
+        | Orientation::Rotate270FlipH => (h, w),
+        _ => (w, h),
+    }
+}
+
+/// Express an oriented-space target request back on the raw (stored) grid by
+/// swapping width/height for the 90/270 rotations, preserving raw aspect.
+fn oriented_request(tw: u32, th: u32, o: Orientation) -> (u32, u32) {
+    match o {
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Rotate90FlipH
+        | Orientation::Rotate270FlipH => (th, tw),
+        _ => (tw, th),
+    }
+}
+
+fn build_scaled_image(pixels: Vec<u8>, fmt: PixelFormat, w: u16, h: u16) -> Option<DynamicImage> {
+    match fmt {
+        PixelFormat::RGB24 => {
+            let buf = image::RgbImage::from_raw(w as u32, h as u32, pixels)?;
+            Some(DynamicImage::ImageRgb8(buf))
+        }
+        PixelFormat::L8 => {
+            let buf = image::GrayImage::from_raw(w as u32, h as u32, pixels)?;
+            Some(DynamicImage::ImageLuma8(buf))
+        }
+        _ => None,
+    }
 }
 
 /// Detect SVG (and gzipped `.svgz`) content before handing bytes to `image`,
@@ -147,10 +281,7 @@ fn core_font_dirs() -> &'static [&'static str] {
 /// directories are silently skipped by `load_fonts_dir`.
 #[cfg(target_os = "linux")]
 fn core_font_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = vec![
-        "/usr/share/fonts".into(),
-        "/usr/local/share/fonts".into(),
-    ];
+    let mut dirs = vec!["/usr/share/fonts".into(), "/usr/local/share/fonts".into()];
     if let Ok(home) = std::env::var("HOME") {
         let home = std::path::Path::new(&home);
         dirs.push(home.join(".fonts"));
@@ -185,9 +316,13 @@ pub struct Loaded {
     pub img: DynamicImage,
 }
 
-pub fn load(source: &Source) -> Result<Loaded, Box<dyn std::error::Error>> {
+pub fn load(
+    source: &Source,
+    opts: &RenderOpts,
+    bounds: (u64, u64),
+) -> Result<Loaded, Box<dyn std::error::Error>> {
     let buf = read_all(source)?;
-    let (img, _) = decode_bytes(&buf)?;
+    let img = decode_for_preview(&buf, opts, bounds)?;
     Ok(Loaded { img })
 }
 
@@ -232,7 +367,11 @@ pub fn load_info(source: &Source) -> Result<ImageInfo, Box<dyn std::error::Error
 fn has_alpha(ct: ColorType) -> bool {
     matches!(
         ct,
-        ColorType::La8 | ColorType::La16 | ColorType::Rgba8 | ColorType::Rgba16 | ColorType::Rgba32F
+        ColorType::La8
+            | ColorType::La16
+            | ColorType::Rgba8
+            | ColorType::Rgba16
+            | ColorType::Rgba32F
     )
 }
 
@@ -291,5 +430,144 @@ mod tests {
             .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
             .count();
         assert!(lit > 0, "expected some text pixels to be lit, got {lit}");
+    }
+
+    // ---- JPEG DCT downscale path ----
+
+    fn opts_width(width: Option<u32>) -> RenderOpts {
+        RenderOpts {
+            width,
+            quality: 50,
+            cell: crate::detect::CellPx { w: 9, h: 18 },
+            win: crate::detect::WinSize {
+                cols: 200,
+                rows: 50,
+                px: None,
+            },
+        }
+    }
+
+    fn encode_jpeg(w: u32, h: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]);
+        }
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Jpeg)
+            .unwrap();
+        out
+    }
+
+    fn encode_jpeg_gray(w: u32, h: u32) -> Vec<u8> {
+        let mut img = image::GrayImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Luma([((x + y) % 256) as u8]);
+        }
+        let mut out = Vec::new();
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Jpeg)
+            .unwrap();
+        out
+    }
+
+    /// Inject a minimal EXIF APP1 segment (Orientation tag) right after SOI, so
+    /// the `image` JPEG decoder reports the given orientation.
+    fn with_exif_orientation(jpeg: &[u8], orientation: u16) -> Vec<u8> {
+        assert!(jpeg.starts_with(b"\xff\xd8"), "expected an SOI marker");
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD offset
+        tiff.extend_from_slice(&1u16.to_le_bytes()); // one directory entry
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation tag
+        tiff.extend_from_slice(&3u16.to_le_bytes()); // type SHORT
+        tiff.extend_from_slice(&1u32.to_le_bytes()); // count 1
+        tiff.extend_from_slice(&(orientation as u32).to_le_bytes()); // value
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // next IFD offset
+        let mut app1 = Vec::new();
+        app1.extend_from_slice(b"Exif\x00\x00");
+        app1.extend_from_slice(&tiff);
+        let mut out = jpeg[..2].to_vec();
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&(app1.len() as u16).to_be_bytes());
+        out.extend_from_slice(&app1);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    #[test]
+    fn jpeg_scale_large_source_small_target() {
+        // 1200x600 RGB source, -w 240 (portrait of the 2:1 grid) => target
+        // 240x120; the DCT decoder returns the 1/4 output => 300x150, which is
+        // below the source and above the target. The render resize then fits.
+        let jpeg = encode_jpeg(1200, 600);
+        let o = opts_width(Some(240));
+        let bounds = (100_000u64, 100_000u64);
+        assert_eq!(size::target_dims(1200, 600, &o, bounds), (240, 120));
+        let img = decode_jpeg_scaled(&jpeg, &o, bounds)
+            .unwrap()
+            .expect("scaled");
+        assert_eq!((img.width(), img.height()), (300, 150));
+        assert!(img.width() >= 240 && img.height() >= 120);
+        assert_eq!(img.color(), ColorType::Rgb8);
+    }
+
+    #[test]
+    fn jpeg_gray_scaled_path() {
+        let jpeg = encode_jpeg_gray(1200, 600);
+        let o = opts_width(Some(240));
+        let bounds = (100_000u64, 100_000u64);
+        let img = decode_jpeg_scaled(&jpeg, &o, bounds)
+            .unwrap()
+            .expect("scaled");
+        assert_eq!((img.width(), img.height()), (300, 150));
+        assert_eq!(img.color(), ColorType::L8);
+    }
+
+    #[test]
+    fn jpeg_small_image_falls_back() {
+        // A JPEG that already fits its target must not be sent through DCT.
+        let jpeg = encode_jpeg(100, 50);
+        let o = opts_width(None);
+        let bounds = (100_000u64, 100_000u64);
+        assert!(decode_jpeg_scaled(&jpeg, &o, bounds).unwrap().is_none());
+    }
+
+    #[test]
+    fn jpeg_exif_orientation_is_preserved() {
+        // Rotate90 (orientation 6) on a 1200x600 raw grid displays as 600x1200,
+        // so the target is a portrait 240x480. The raw DCT request is (480,240),
+        // yielding 600x300, then rotated to a 300x600 portrait.
+        let jpeg = with_exif_orientation(&encode_jpeg(1200, 600), 6);
+        let o = opts_width(Some(240));
+        let bounds = (100_000u64, 100_000u64);
+        assert_eq!(size::target_dims(600, 1200, &o, bounds), (240, 480));
+        let img = decode_jpeg_scaled(&jpeg, &o, bounds)
+            .unwrap()
+            .expect("scaled");
+        assert_eq!(
+            (img.width(), img.height()),
+            (300, 600),
+            "orientation must swap dims"
+        );
+        assert!(img.width() >= 240 && img.height() >= 480);
+    }
+
+    #[test]
+    fn decode_for_preview_scales_rgb_and_leaves_png_full() {
+        let o = opts_width(Some(240));
+        let bounds = (100_000u64, 100_000u64);
+        // JPEG goes through DCT scaling.
+        let jpeg = encode_jpeg(1200, 600);
+        let scaled = decode_for_preview(&jpeg, &o, bounds).unwrap();
+        assert_eq!((scaled.width(), scaled.height()), (300, 150));
+        // PNG never uses DCT scaling: a full decode, exact resize is done later.
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(1200, 600))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let full = decode_for_preview(&png, &o, bounds).unwrap();
+        assert_eq!((full.width(), full.height()), (1200, 600));
     }
 }

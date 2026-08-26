@@ -20,6 +20,7 @@ image  = { version = "0.25", default-features = false, features = [
     "bmp", "pnm", "qoi", "ff", "ico",
     "tiff", "hdr", "exr",
 ] }
+jpeg-decoder = { version = "0.3.2", default-features = false }
 libc   = "0.2"
 flate2 = "1"
 resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts", "raster-images", "svgz"] }

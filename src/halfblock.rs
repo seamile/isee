@@ -11,10 +11,12 @@ pub fn render(img: &DynamicImage, o: &RenderOpts) -> String {
     let rgba = if cells_w == img.width() && px_h == img.height() {
         img.to_rgba8()
     } else {
-        img.resize(cells_w, px_h, size::filter(o.quality)).to_rgba8()
+        img.resize(cells_w, px_h, size::filter(o.quality))
+            .into_rgba8()
     };
 
-    let mut out = String::with_capacity(cells_w as usize * cells_h as usize * 40 + cells_h as usize);
+    let mut out =
+        String::with_capacity(cells_w as usize * cells_h as usize * 40 + cells_h as usize);
     use std::fmt::Write as _;
     for cy in 0..cells_h {
         for cx in 0..cells_w {
@@ -22,7 +24,11 @@ pub fn render(img: &DynamicImage, o: &RenderOpts) -> String {
             let bot = pixel(&rgba, cx, cy * 2 + 1);
             let (tr, tg, tb) = blend(top);
             let (br, bg, bb) = blend(bot);
-            write!(out, "\x1b[38;2;{tr};{tg};{tb}m\x1b[48;2;{br};{bg};{bb}m\u{2580}").unwrap();
+            write!(
+                out,
+                "\x1b[38;2;{tr};{tg};{tb}m\x1b[48;2;{br};{bg};{bb}m\u{2580}"
+            )
+            .unwrap();
         }
         out.push_str("\x1b[0m\n");
     }

@@ -21,7 +21,7 @@ pub fn render(img: &DynamicImage, o: &RenderOpts, id: u32) -> Vec<u8> {
     let rgba = if tw == img.width() && th == img.height() {
         img.to_rgba8()
     } else {
-        img.resize(tw, th, size::filter(o.quality)).to_rgba8()
+        img.resize(tw, th, size::filter(o.quality)).into_rgba8()
     };
     let (w, h) = rgba.dimensions();
     // Grid of cells that will hold the placeholder; only anchors placement,
@@ -415,8 +415,16 @@ fn base64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -430,7 +438,11 @@ mod tests {
             width: None,
             quality: 50,
             cell: crate::detect::CellPx { w: 9, h: 18 },
-            win: crate::detect::WinSize { cols: 80, rows: 24, px: None },
+            win: crate::detect::WinSize {
+                cols: 80,
+                rows: 24,
+                px: None,
+            },
         }
     }
 
@@ -524,8 +536,15 @@ mod tests {
         // that parks the cursor below the image; no bare LF and no cursor
         // save/restore positioning.
         assert!(!s.contains("\x1b[s"), "save cursor must not be used: {s}");
-        assert!(!s.contains("\x1b[u"), "restore cursor must not be used: {s}");
-        assert_eq!(s.matches('\n').count(), 2, "expected 1 separator + 1 trailing");
+        assert!(
+            !s.contains("\x1b[u"),
+            "restore cursor must not be used: {s}"
+        );
+        assert_eq!(
+            s.matches('\n').count(),
+            2,
+            "expected 1 separator + 1 trailing"
+        );
         for (i, b) in s.bytes().enumerate() {
             if b == b'\n' {
                 assert_eq!(s.as_bytes()[i - 1], b'\r', "LF at byte {i} lacks CR");

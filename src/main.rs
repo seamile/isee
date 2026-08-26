@@ -63,7 +63,9 @@ fn run(args: &cli::Args) -> Result<(), AppErr> {
         Some(p) => input::Source::Path(p.clone()),
         None => {
             if detect::is_tty(0) {
-                return Err(AppErr::Usage("no image path and stdin is a terminal".into()));
+                return Err(AppErr::Usage(
+                    "no image path and stdin is a terminal".into(),
+                ));
             }
             input::Source::Stdin
         }
@@ -78,11 +80,12 @@ fn run(args: &cli::Args) -> Result<(), AppErr> {
             input::Source::Stdin => "-".to_string(),
         };
         print!("{}", info::render(&path, &info));
-        io::stdout().flush().map_err(|e| AppErr::Fatal(e.to_string()))?;
+        io::stdout()
+            .flush()
+            .map_err(|e| AppErr::Fatal(e.to_string()))?;
         return Ok(());
     }
 
-    let loaded = input::load(&source).map_err(|e| AppErr::Fatal(e.to_string()))?;
     let term = detect::detect(stdout.as_raw_fd());
     let opts = size::RenderOpts {
         width: args.width,
@@ -90,6 +93,11 @@ fn run(args: &cli::Args) -> Result<(), AppErr> {
         cell: term.cell,
         win: term.win,
     };
+    let bounds = match term.protocol {
+        Protocol::Kitty => size::kitty_bounds(&opts),
+        Protocol::HalfBlocks => size::halfblock_bounds(&opts),
+    };
+    let loaded = input::load(&source, &opts, bounds).map_err(|e| AppErr::Fatal(e.to_string()))?;
     let mut bytes = match term.protocol {
         Protocol::Kitty => kitty::render(&loaded.img, &opts, kitty::new_image_id()),
         Protocol::HalfBlocks => halfblock::render(&loaded.img, &opts).into_bytes(),

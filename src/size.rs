@@ -58,10 +58,23 @@ pub fn filter(quality: u8) -> image::imageops::FilterType {
 
 pub fn target_px(img: &DynamicImage, o: &RenderOpts, bounds: (u64, u64)) -> (u32, u32) {
     let (iw, ih) = img.dimensions();
+    target_dims(iw, ih, o, bounds)
+}
+
+/// Compute the preview target pixel size from raw dimensions `(iw, ih)` rather
+/// than a `DynamicImage`, so callers can drive scaling from an image header
+/// (plus EXIF orientation) before any full decode. `target_px` is a thin
+/// wrapper over this, so kitty/half-block rendering is unchanged.
+pub fn target_dims(iw: u32, ih: u32, o: &RenderOpts, bounds: (u64, u64)) -> (u32, u32) {
     let iw = iw.max(1) as u64;
     let ih = ih.max(1) as u64;
     let (tw, th) = match o.width {
-        Some(w) => contain(w.max(1) as u64, (ih * w.max(1) as u64 / iw).max(1), bounds.0, bounds.1),
+        Some(w) => contain(
+            w.max(1) as u64,
+            (ih * w.max(1) as u64 / iw).max(1),
+            bounds.0,
+            bounds.1,
+        ),
         // No explicit width: display at the image's native pixel size (ignore
         // DPI), shrinking only to fit the bounds.
         None => contain(iw, ih, bounds.0, bounds.1),
@@ -90,7 +103,11 @@ mod tests {
             width: None,
             quality: 50,
             cell: CellPx { w: 9, h: 18 },
-            win: WinSize { cols: 80, rows: 24, px: None },
+            win: WinSize {
+                cols: 80,
+                rows: 24,
+                px: None,
+            },
         }
     }
 
@@ -109,14 +126,21 @@ mod tests {
         let o = opts();
         // max 720x432 (80 cols x 9 px, 24 rows x 18 px), contain 2000x1000
         // -> scale 0.36 -> 720x360.
-        assert_eq!(target_px(&img(2000, 1000), &o, kitty_bounds(&o)), (720, 360));
+        assert_eq!(
+            target_px(&img(2000, 1000), &o, kitty_bounds(&o)),
+            (720, 360)
+        );
     }
 
     #[test]
     fn width_request_allows_upscale() {
         let mut o = opts();
         o.width = Some(800);
-        o.win = WinSize { cols: 200, rows: 50, px: None }; // max 1800x900
+        o.win = WinSize {
+            cols: 200,
+            rows: 50,
+            px: None,
+        }; // max 1800x900
         assert_eq!(target_px(&img(100, 50), &o, kitty_bounds(&o)), (800, 400));
     }
 
@@ -133,7 +157,11 @@ mod tests {
         // Window of 200 cols x 50 rows = 1800x900 px: images that fit are
         // shown at native size, never upscaled or shrunk by DPI or the grid.
         let mut o = opts();
-        o.win = WinSize { cols: 200, rows: 50, px: None };
+        o.win = WinSize {
+            cols: 200,
+            rows: 50,
+            px: None,
+        };
         assert_eq!(target_px(&img(100, 50), &o, kitty_bounds(&o)), (100, 50));
         assert_eq!(target_px(&img(982, 548), &o, kitty_bounds(&o)), (982, 548));
     }
@@ -143,7 +171,10 @@ mod tests {
         let o = opts();
         // max 720x432: 982x548 -> scale 720/982 -> 720x402; 2000x1000 -> 720x360.
         assert_eq!(target_px(&img(982, 548), &o, kitty_bounds(&o)), (720, 402));
-        assert_eq!(target_px(&img(2000, 1000), &o, kitty_bounds(&o)), (720, 360));
+        assert_eq!(
+            target_px(&img(2000, 1000), &o, kitty_bounds(&o)),
+            (720, 360)
+        );
     }
 
     #[test]
@@ -157,7 +188,10 @@ mod tests {
         assert_eq!(kitty_bounds(&o), (1440, 864));
         // 982x548 now fits natively; a 2000x1000 image scales to 1440x720.
         assert_eq!(target_px(&img(982, 548), &o, kitty_bounds(&o)), (982, 548));
-        assert_eq!(target_px(&img(2000, 1000), &o, kitty_bounds(&o)), (1440, 720));
+        assert_eq!(
+            target_px(&img(2000, 1000), &o, kitty_bounds(&o)),
+            (1440, 720)
+        );
     }
 
     #[test]
@@ -191,5 +225,61 @@ mod tests {
     fn halfblock_bounds_are_logical() {
         let o = opts();
         assert_eq!(halfblock_bounds(&o), (720, 864));
+    }
+
+    #[test]
+    fn target_dims_matches_target_px() {
+        // The header-driven path must agree with the decoded-image wrapper.
+        let mut o = opts();
+        o.width = Some(800);
+        o.win = WinSize {
+            cols: 200,
+            rows: 50,
+            px: None,
+        }; // max 1800x900
+        let bounds = kitty_bounds(&o);
+        assert_eq!(
+            target_px(&img(100, 50), &o, bounds),
+            target_dims(100, 50, &o, bounds)
+        );
+        assert_eq!(target_dims(100, 50, &o, bounds), (800, 400));
+    }
+
+    #[test]
+    fn target_dims_width_upscales_and_caps() {
+        let mut o = opts();
+        o.width = Some(800);
+        o.win = WinSize {
+            cols: 200,
+            rows: 50,
+            px: None,
+        };
+        assert_eq!(target_dims(100, 50, &o, kitty_bounds(&o)), (800, 400));
+        // A huge width request is capped by the terminal bounds (width-bound here).
+        o.width = Some(5000);
+        assert_eq!(target_dims(2000, 1000, &o, kitty_bounds(&o)), (1800, 900));
+    }
+
+    #[test]
+    fn target_dims_natural_size_and_bounds() {
+        let o = opts();
+        let b = kitty_bounds(&o); // 720x432
+        assert_eq!(target_dims(982, 548, &o, b), (720, 402));
+        assert_eq!(target_dims(2000, 1000, &o, b), (720, 360));
+        // Small images keep their native size (never upscaled by the bounds).
+        assert_eq!(target_dims(100, 50, &o, b), (100, 50));
+    }
+
+    #[test]
+    fn target_dims_swapped_for_90_rotation() {
+        // A 4000x3000 raw JPEG displayed with Rotate90 becomes 3000x4000; the
+        // target must be computed from the ORIENTED dims (portrait), not the
+        // raw landscape grid.
+        let mut o = opts();
+        o.width = Some(720);
+        let b = (100_000u64, 100_000u64); // unbounded so width dominates
+        let (tw, th) = target_dims(3000, 4000, &o, b); // oriented dims
+        assert_eq!((tw, th), (720, 960)); // portrait aspect preserved
+        assert_eq!(target_dims(4000, 3000, &o, b), (720, 540)); // landscape
     }
 }
