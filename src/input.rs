@@ -60,12 +60,47 @@ fn is_svg(buf: &[u8]) -> bool {
 }
 
 /// `usvg::Options::default()` leaves the font database empty, so resvg finds no
-/// matching face and silently drops every `<text>`. Load the system fonts once
-/// so SVG text renders instead of vanishing.
+/// matching face and silently drops every `<text>`. Load a curated set of system
+/// font directories so SVG text renders instead of vanishing.
 fn svg_options() -> resvg::usvg::Options<'static> {
     let mut opt = resvg::usvg::Options::default();
-    opt.fontdb_mut().load_system_fonts();
+    let db = opt.fontdb_mut();
+    for dir in core_font_dirs() {
+        db.load_fonts_dir(dir);
+    }
     opt
+}
+
+/// `fontdb::load_system_fonts()` scans every font the OS knows about — on macOS
+/// that includes a huge pool of downloadable fonts (the `AssetsV2` tree), which
+/// is the single biggest cost of rendering SVG text. Loading only the core
+/// system directories keeps common fonts working while shaving a large chunk off
+/// startup, at the price of not covering some less-common faces.
+#[cfg(target_os = "macos")]
+fn core_font_dirs() -> &'static [&'static str] {
+    &[
+        "/System/Library/Fonts",
+        "/System/Library/Fonts/Supplemental",
+        "/Library/Fonts",
+    ]
+}
+
+/// Linux has no font-flattened system dir like macOS; mirror `fontdb`'s
+/// non-fontconfig fallback set (system dirs + the user's `~/.fonts` and
+/// `~/.local/share/fonts`) so user-installed fonts still resolve. Missing
+/// directories are silently skipped by `load_fonts_dir`.
+#[cfg(target_os = "linux")]
+fn core_font_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![
+        "/usr/share/fonts".into(),
+        "/usr/local/share/fonts".into(),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        let home = std::path::Path::new(&home);
+        dirs.push(home.join(".fonts"));
+        dirs.push(home.join(".local/share/fonts"));
+    }
+    dirs
 }
 
 fn decode_svg(buf: &[u8]) -> Result<DynamicImage, Box<dyn std::error::Error>> {
