@@ -135,7 +135,7 @@ fn run_preview(
     let term = detect::detect(stdout.as_raw_fd());
     let opts = size::RenderOpts {
         width: args.width,
-        quality: args.quality.unwrap_or(50),
+        quality: args.quality,
         cell: term.cell,
         win: term.win,
     };

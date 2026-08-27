@@ -43,18 +43,45 @@ pub fn halfblock_bounds(o: &RenderOpts) -> (u64, u64) {
 
 pub struct RenderOpts {
     pub width: Option<u32>,
-    pub quality: u8,
+    pub quality: Quality,
     pub cell: CellPx,
     pub win: WinSize,
 }
 
-pub fn filter(quality: u8) -> image::imageops::FilterType {
-    if quality >= 50 {
-        image::imageops::FilterType::Lanczos3
-    } else {
-        image::imageops::FilterType::Triangle
+/// Preview quality tier mapped to a resize filter:
+/// - Low: Nearest (1 sample per pixel) — fastest, but aliasing when shrinking
+/// - Medium: Triangle (2x2 bilinear) — smooth, slight softening
+/// - High: Lanczos3 (6x6 windowed sinc) — sharpest, may ring on hard edges
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Quality {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl Quality {
+    pub fn parse(v: &str) -> Option<Quality> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "l" => Some(Quality::Low),
+            "m" => Some(Quality::Medium),
+            "h" => Some(Quality::High),
+            _ => None,
+        }
     }
 }
+
+pub fn filter(quality: Quality) -> image::imageops::FilterType {
+    match quality {
+        Quality::Low => image::imageops::FilterType::Nearest,
+        Quality::Medium => image::imageops::FilterType::Triangle,
+        Quality::High => image::imageops::FilterType::Lanczos3,
+    }
+}
+
+/// Cap for previews without an explicit `-w`: wide images are downscaled to at
+/// most this pixel width (bounded in turn by the terminal window size).
+pub const DEFAULT_MAX_WIDTH: u64 = 1920;
 
 pub fn target_px(img: &DynamicImage, o: &RenderOpts, bounds: (u64, u64)) -> (u32, u32) {
     let (iw, ih) = img.dimensions();
@@ -76,8 +103,10 @@ pub fn target_dims(iw: u32, ih: u32, o: &RenderOpts, bounds: (u64, u64)) -> (u32
             bounds.1,
         ),
         // No explicit width: display at the image's native pixel size (ignore
-        // DPI), shrinking only to fit the bounds.
-        None => contain(iw, ih, bounds.0, bounds.1),
+        // DPI), capped at DEFAULT_MAX_WIDTH and then shrunk only as needed to
+        // fit the bounds. The window width always wins over any requested or
+        // default cap.
+        None => contain(iw, ih, bounds.0.min(DEFAULT_MAX_WIDTH), bounds.1),
     };
     (tw as u32, th as u32)
 }
@@ -101,7 +130,7 @@ mod tests {
     fn opts() -> RenderOpts {
         RenderOpts {
             width: None,
-            quality: 50,
+            quality: Quality::default(),
             cell: CellPx { w: 9, h: 18 },
             win: WinSize {
                 cols: 80,
@@ -281,5 +310,43 @@ mod tests {
         let (tw, th) = target_dims(3000, 4000, &o, b); // oriented dims
         assert_eq!((tw, th), (720, 960)); // portrait aspect preserved
         assert_eq!(target_dims(4000, 3000, &o, b), (720, 540)); // landscape
+    }
+
+    #[test]
+    fn without_width_capped_at_default_max_width() {
+        // Even with a huge terminal, previews without -w never exceed 1920 px
+        // wide; smaller images keep their native size.
+        let o = opts();
+        let b = (100_000u64, 100_000u64);
+        assert_eq!(target_dims(4000, 2000, &o, b), (1920, 960));
+        assert_eq!(target_dims(1920, 1080, &o, b), (1920, 1080));
+        assert_eq!(target_dims(800, 400, &o, b), (800, 400));
+    }
+
+    #[test]
+    fn default_width_cap_yields_to_window() {
+        // The window width always wins: min(window, 1920).
+        let mut o = opts(); // window bounds 720x432
+        let b = kitty_bounds(&o);
+        assert_eq!(target_dims(4000, 2000, &o, b), (720, 360));
+        // Explicit -w is also still capped by the window.
+        o.width = Some(10_000);
+        assert_eq!(target_dims(1000, 500, &o, b), (720, 360));
+        // ...and window height matters for tall images under the cap.
+        o.width = None;
+        assert_eq!(target_dims(1500, 4000, &o, b), (162, 432));
+    }
+
+    #[test]
+    fn quality_tiers_map_to_filters() {
+        use image::imageops::FilterType as F;
+        assert_eq!(filter(Quality::Low), F::Nearest);
+        assert_eq!(filter(Quality::Medium), F::Triangle);
+        assert_eq!(filter(Quality::High), F::Lanczos3);
+        assert_eq!(Quality::default(), Quality::Medium);
+        assert_eq!(Quality::parse("l"), Some(Quality::Low));
+        assert_eq!(Quality::parse("H"), Some(Quality::High));
+        assert_eq!(Quality::parse(" x "), None);
+        assert_eq!(Quality::parse("80"), None);
     }
 }

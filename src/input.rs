@@ -510,7 +510,7 @@ mod tests {
     fn opts_width(width: Option<u32>) -> RenderOpts {
         RenderOpts {
             width,
-            quality: 50,
+            quality: size::Quality::default(),
             cell: crate::detect::CellPx { w: 9, h: 18 },
             win: crate::detect::WinSize {
                 cols: 200,

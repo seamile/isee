@@ -21,10 +21,14 @@ If `IMGPATH` is omitted, image data is read from `stdin`.
 ## Options
 
 - `-w WIDTH`: Preview at the given pixel width (e.g. `-w 800` for 800px)
-- `-q QUALITY`: Preview quality, 0–100 (e.g. `-q 80` for 80%)
+- `-q QUALITY`: Preview scaling quality: `L` (nearest, fastest), `M`
+  (triangle, default), `H` (lanczos, sharpest)
 - `-i`: Show image information (size, dimensions, DPI, colorspace, alpha)
-- `-v, --version`: Print the version
+- `-v`: Print the version
 - `-h, --help`: Print help
+
+Without `-w`, previews are capped at 1920px wide; a preview is never wider
+than the terminal window.
 
 ## Supported formats
 
@@ -48,8 +52,8 @@ isee /foo/bar/image.jpg
 # Preview with width 800px
 isee -w 800 /foo/bar/image.jpg
 
-# Preview with quality 80%
-isee -q 80 /foo/bar/image.jpg
+# Preview with the sharpest scaling
+isee -q H /foo/bar/image.jpg
 
 # Show image information
 isee -i /foo/bar/image.jpg

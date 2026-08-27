@@ -436,7 +436,7 @@ mod tests {
     fn opts() -> RenderOpts {
         RenderOpts {
             width: None,
-            quality: 50,
+            quality: size::Quality::default(),
             cell: crate::detect::CellPx { w: 9, h: 18 },
             win: crate::detect::WinSize {
                 cols: 80,

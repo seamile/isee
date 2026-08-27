@@ -1,12 +1,25 @@
 use std::fmt;
 use std::path::PathBuf;
 
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
+use crate::size::Quality;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
     pub width: Option<u32>,
-    pub quality: Option<u8>,
+    pub quality: Quality,
     pub info: bool,
     pub paths: Vec<PathBuf>,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Args {
+            width: None,
+            quality: Quality::default(),
+            info: false,
+            paths: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -15,6 +28,7 @@ pub enum ParseError {
     Version,
     MissingValue(&'static str),
     InvalidNumber(&'static str, String),
+    InvalidQuality(String),
     UnknownOption(String),
 }
 
@@ -25,6 +39,9 @@ impl fmt::Display for ParseError {
             ParseError::Version => write!(f, "version"),
             ParseError::MissingValue(opt) => write!(f, "option {opt} requires a value"),
             ParseError::InvalidNumber(opt, v) => write!(f, "invalid value {v:?} for option {opt}"),
+            ParseError::InvalidQuality(v) => {
+                write!(f, "invalid quality {v:?}: expected L, M or H")
+            }
             ParseError::UnknownOption(o) => write!(f, "unknown option {o}"),
         }
     }
@@ -34,15 +51,17 @@ pub const USAGE: &str = "\
 Usage: isee [OPTIONS] [IMGPATH ...]
 
 Preview images in the terminal.
+If IMGPATH is omitted, image data is read from stdin.
 
 Options:
-  -w WIDTH   Preview at the given pixel width
-  -q QUALITY Preview quality (0-100)
+  -w WIDTH   Preview at the given pixel width.
+             Without -w, previews are capped at 1920 px wide. A preview is
+             never wider than the terminal window.
+  -q QUALITY Preview scaling quality: L (nearest), M (triangle), H (lanczos);
+             default M
   -i         Show image information
-  -v, --version Print version
+  -v         Print version
   -h, --help Print help
-
-If IMGPATH is omitted, image data is read from stdin.
 ";
 
 pub fn parse<I, S>(args: I) -> Result<Args, ParseError>
@@ -58,12 +77,12 @@ where
             continue;
         }
         if let Some(v) = short_value("-q", &arg) {
-            out.quality = Some(parse_quality(v)?);
+            out.quality = parse_quality(v)?;
             continue;
         }
         match arg.as_str() {
             "-h" | "--help" => return Err(ParseError::Help),
-            "-v" | "--version" => return Err(ParseError::Version),
+            "-v" => return Err(ParseError::Version),
             "-i" => out.info = true,
             "-w" => {
                 let v = it.next().ok_or(ParseError::MissingValue("-w"))?;
@@ -71,7 +90,7 @@ where
             }
             "-q" => {
                 let v = it.next().ok_or(ParseError::MissingValue("-q"))?;
-                out.quality = Some(parse_quality(&v)?);
+                out.quality = parse_quality(&v)?;
             }
             s if s.starts_with('-') && s.len() > 1 => {
                 return Err(ParseError::UnknownOption(s.to_string()));
@@ -84,7 +103,7 @@ where
 
 fn short_value<'a>(opt: &str, arg: &'a str) -> Option<&'a str> {
     arg.strip_prefix(opt)
-        .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
 fn parse_num(opt: &'static str, v: &str) -> Result<u32, ParseError> {
@@ -93,12 +112,8 @@ fn parse_num(opt: &'static str, v: &str) -> Result<u32, ParseError> {
         .map_err(|_| ParseError::InvalidNumber(opt, v.to_string()))
 }
 
-fn parse_quality(v: &str) -> Result<u8, ParseError> {
-    let n = parse_num("-q", v)?;
-    if n > 100 {
-        return Err(ParseError::InvalidNumber("-q", n.to_string()));
-    }
-    Ok(n as u8)
+fn parse_quality(v: &str) -> Result<Quality, ParseError> {
+    Quality::parse(v).ok_or_else(|| ParseError::InvalidQuality(v.trim().to_string()))
 }
 
 #[cfg(test)]
@@ -115,16 +130,21 @@ mod tests {
 
     #[test]
     fn parse_width_quality_path() {
-        let a = parse(["-w", "800", "-q", "80", "img.png"]).unwrap();
+        let a = parse(["-w", "800", "-q", "h", "img.png"]).unwrap();
         assert_eq!(a.width, Some(800));
-        assert_eq!(a.quality, Some(80));
+        assert_eq!(a.quality, Quality::High);
         assert_eq!(a.paths, vec![PathBuf::from("img.png")]);
     }
 
     #[test]
     fn parse_combined_short() {
         assert_eq!(parse(["-w800"]).unwrap().width, Some(800));
-        assert_eq!(parse(["-q75"]).unwrap().quality, Some(75));
+        let l = parse(["-ql"]).unwrap();
+        assert_eq!(l.quality, Quality::Low);
+        let m = parse(["-qM", "-i"]).unwrap();
+        assert_eq!(m.quality, Quality::Medium);
+        assert!(m.info);
+        assert_eq!(parse(["-q", "H"]).unwrap().quality, Quality::High);
     }
 
     #[test]
@@ -142,7 +162,10 @@ mod tests {
     #[test]
     fn parse_version() {
         assert!(matches!(parse(["-v"]), Err(ParseError::Version)));
-        assert!(matches!(parse(["--version"]), Err(ParseError::Version)));
+        assert!(matches!(
+            parse(["--version"]),
+            Err(ParseError::UnknownOption(o)) if o == "--version"
+        ));
     }
 
     #[test]
@@ -165,15 +188,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_quality_range() {
+    fn parse_quality_levels() {
+        assert_eq!(parse(["-q", "l"]).unwrap().quality, Quality::Low);
+        assert_eq!(parse(["-q", "m"]).unwrap().quality, Quality::Medium);
+        assert_eq!(parse(["-q", "h"]).unwrap().quality, Quality::High);
         assert!(matches!(
-            parse(["-q", "101"]),
-            Err(ParseError::InvalidNumber(..))
+            parse(["-q", "80"]),
+            Err(ParseError::InvalidQuality(v)) if v == "80"
         ));
         assert!(matches!(
-            parse(["-q", "-1"]),
-            Err(ParseError::InvalidNumber(..))
+            parse(["-qx"]),
+            Err(ParseError::InvalidQuality(..))
         ));
+    }
+
+    #[test]
+    fn parse_defaults_to_medium_quality() {
+        let a = parse(std::iter::empty::<&str>()).unwrap();
+        assert_eq!(a.quality, Quality::Medium);
     }
 
     #[test]
