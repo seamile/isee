@@ -27,8 +27,11 @@ fn read_all(source: &Source) -> io::Result<Vec<u8>> {
 
 /// Maximum single edge (width or height) allowed for a regular preview decode.
 const PREVIEW_MAX_DIMENSION: u32 = 12_000;
-/// Maximum bytes a single preview allocation may reserve.
-const PREVIEW_MAX_ALLOC: u64 = 128 * 1024 * 1024;
+/// Maximum bytes a single preview allocation may reserve. The budget is a
+/// decompression-bomb guard, not steady-state usage: decoded pixels are
+/// resized down to the terminal window right after. 384 MiB covers ~100 MP
+/// RGBA8 (e.g. 12000x8300), which full-decode formats like PNG need in full.
+const PREVIEW_MAX_ALLOC: u64 = 384 * 1024 * 1024;
 /// Maximum pixel count allowed when rasterizing an SVG preview.
 const SVG_MAX_PIXELS: u64 = 16 * 1024 * 1024;
 
