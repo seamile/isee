@@ -10,6 +10,17 @@ for terminals without graphics support.
 > **Platform support** — `isee` is currently built and tested on Linux and
 > macOS. Windows is not yet supported.
 
+## Installation
+
+Install with Cargo:
+
+```sh
+cargo install isee
+```
+
+Or download a prebuilt binary from the
+[releases page](https://github.com/seamile/isee/releases).
+
 ## Usage
 
 ```
