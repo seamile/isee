@@ -3,23 +3,12 @@ use std::path::PathBuf;
 
 use crate::size::Quality;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Args {
     pub width: Option<u32>,
     pub quality: Quality,
     pub info: bool,
     pub paths: Vec<PathBuf>,
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Args {
-            width: None,
-            quality: Quality::default(),
-            info: false,
-            paths: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug)]
