@@ -1,10 +1,14 @@
+mod b64;
+mod brand;
 mod cli;
 mod detect;
 mod halfblock;
+mod iip;
 mod info;
 mod input;
 mod kitty;
 mod meta;
+mod sixel;
 mod size;
 
 use std::fmt;
@@ -141,6 +145,7 @@ fn run_preview(
     };
     let bounds = match term.protocol {
         Protocol::Kitty => size::kitty_bounds(&opts),
+        Protocol::Iip | Protocol::Sixel => size::bitmap_bounds(&opts),
         Protocol::HalfBlocks => size::halfblock_bounds(&opts),
     };
 
@@ -153,10 +158,15 @@ fn run_preview(
             Ok(loaded) => {
                 let mut block = match term.protocol {
                     Protocol::Kitty => kitty::render(&loaded.img, &opts, kitty::new_image_id()),
+                    Protocol::Iip => iip::render(&loaded.img, &opts),
+                    Protocol::Sixel => sixel::render(&loaded.img, &opts),
                     Protocol::HalfBlocks => halfblock::render(&loaded.img, &opts).into_bytes(),
                 };
-                if term.tmux && matches!(term.protocol, Protocol::Kitty) {
-                    block = detect::wrap_kitty_passthrough(&block);
+                // Sixel is downgraded to Half Blocks at detect() time (nested
+                // DCS escaping does not survive tmux), so only Kitty APC
+                // chunks and Iip OSC frames get the passthrough treatment.
+                if term.tmux && matches!(term.protocol, Protocol::Kitty | Protocol::Iip) {
+                    block = detect::wrap_graphics_passthrough(&block);
                 }
                 emit_preview_item(&mut out, multi, term.protocol, wrote_before, &path, &block)
                     .map_err(|e| AppErr::Fatal(e.to_string()))?;
@@ -180,10 +190,12 @@ fn run_preview(
 }
 
 /// Stream one preview image to `out`, flushing nothing itself. A single image
-/// emits no path title and gives non-Kitty a trailing newline; multiple images
-/// precede each image with its original path and separate it from the previous
-/// one by exactly one blank line. `wrote_before` reflects whether an earlier
-/// image was already emitted, so a failed file never blocks later ones.
+/// emits no path title; only Half Blocks gets a trailing newline (Kitty/Iip/
+/// Sixel blocks already end by moving the cursor off the image themselves).
+/// Multiple images precede each image with its original path and separate it
+/// from the previous one by exactly one blank line. `wrote_before` reflects
+/// whether an earlier image was already emitted, so a failed file never
+/// blocks later ones.
 fn emit_preview_item(
     out: &mut dyn Write,
     multi: bool,
@@ -200,7 +212,7 @@ fn emit_preview_item(
         out.write_all(b"\n")?;
     }
     out.write_all(block)?;
-    if !multi && !matches!(protocol, Protocol::Kitty) {
+    if !multi && matches!(protocol, Protocol::HalfBlocks) {
         out.write_all(b"\n")?;
     }
     Ok(())
@@ -266,6 +278,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, b"BLOCK\n");
+    }
+
+    #[test]
+    fn single_iip_sixel_blocks_are_verbatim() {
+        // Iip/Sixel blocks carry their own cursor-parking CRLFs; a bare
+        // trailing newline would add an unwanted blank line.
+        for p in [Protocol::Iip, Protocol::Sixel] {
+            let mut out = Vec::new();
+            emit_preview_item(&mut out, false, p, false, "a.png", b"FRAME\r\n").unwrap();
+            assert_eq!(out, b"FRAME\r\n", "{p:?}");
+        }
     }
 
     #[test]

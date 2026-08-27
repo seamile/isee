@@ -3,9 +3,11 @@
 A small utility for previewing images in the terminal.
 
 `isee` detects the terminal's image protocol at runtime and renders the image
-with either the **Kitty graphics protocol** (with Unicode placeholder cells for
-precise sizing) or **Half Blocks** (color-reduced character pairs) as a fallback
-for terminals without graphics support.
+with the **Kitty graphics protocol** (with Unicode placeholder cells for
+precise sizing), **Iip** (iTerm2 OSC 1337 inline file: Warp, iTerm2, mintty,
+VSCode, Tabby, Hyper), or **Sixel** (Foot, Konsole, Windows Terminal,
+BlackBox). Terminals without graphics support fall back to **Half Blocks**
+(color-reduced character pairs).
 
 > **Platform support** — `isee` is currently built and tested on Linux and
 > macOS. Windows is not yet supported.
@@ -94,8 +96,19 @@ cat /foo/bar/image.jpg | isee
   the APC transfer frames are wrapped in passthrough; the placeholder cells go
   through the tmux grid so they land in the right pane and survive redraws.
 
+- **Iip rendering** — Terminals speaking iTerm2's OSC 1337 inline-file protocol
+  (Warp, iTerm2, mintty, VSCode, Tabby, Hyper) receive the resized image
+  base64-encoded in one frame — PNG for alpha images, JPEG q85 otherwise.
+  Inside `tmux` the frame is wrapped in DCS passthrough.
+
+- **Sixel rendering** — Sixel terminals (Foot, Konsole, Windows Terminal,
+  BlackBox) get a Wu-quantized (256-color) sixel bitmap. Inside `tmux`, nested
+  DCS escaping is unreliable, so Sixel degrades to Half Blocks there; force it
+  with `ISEE_PROTOCOL=sixel` if you know your setup works.
+
 - **Half Blocks fallback** — Terminals without graphics support get a downscaled,
-  color-reduced character-pair rendering.
+  color-reduced character-pair rendering. `ISEE_PROTOCOL=half|kitty|iip|sixel`
+  overrides detection (`half` is the universal escape hatch).
 
 ## Acknowledgements
 

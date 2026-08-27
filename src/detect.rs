@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
     Kitty,
+    Iip,
+    Sixel,
     HalfBlocks,
 }
 
@@ -49,36 +51,50 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
     let override_p = isee_override();
     let env_kitty = env_kitty_hint();
 
+    // Brand-based selection (env table, mirroring yazi): covers bitmap
+    // terminals the KGP hint does not reach. Kitty-family brands map to None
+    // and keep riding the dedicated KGP probe below.
+    let brand = crate::brand::detect(|name| env::var(name).ok());
+    let brand_proto = brand.and_then(crate::brand::preferred_protocol);
+
     let mut cell = fallback_cell();
     let mut probed_kitty = false;
 
     if override_p.is_none()
         && stdout_tty
-        && env_kitty
+        && (env_kitty || brand_proto.is_some())
         && let Some(mut tty) = RawTty::new()
     {
-        // Only probe when the environment signals Kitty support. Sending the
-        // KGP query to an unsupporting terminal leaks the APC payload as
-        // visible text, so never probe a bare xterm/screen-style terminal
-        // (TERM=xterm-256color etc.) where it can only be a no-op.
+        // Cell probing (`CSI 16 t`) is harmless and broadly supported, so it
+        // runs for every graphics-capable terminal. The KGP query however
+        // leaks its APC payload as visible text on unsupporting terminals,
+        // so it stays gated on the strict kitty-environment hints.
         // Inside tmux the pane's own terminal is tmux's virtual terminal;
         // probe the OUTER terminal by wrapping the queries in tmux's DCS
         // passthrough (mirroring yazi), after making sure passthrough is on.
         if tmux {
             enable_tmux_passthrough();
         }
-        probed_kitty = probe_kgp(&mut tty, tmux);
+        if env_kitty {
+            probed_kitty = probe_kgp(&mut tty, tmux);
+        }
         if let Some(c) = probe_cell_px(&mut tty, tmux) {
             cell = c;
         }
         drain_input(tty.file.as_raw_fd());
     }
 
-    let protocol = match override_p {
+    let mut protocol = match override_p {
         Some(p) => p,
         None if probed_kitty || env_kitty => Protocol::Kitty,
-        None => Protocol::HalfBlocks,
+        None => brand_proto.unwrap_or(Protocol::HalfBlocks),
     };
+    // Sixel inside tmux would need a sixel DCS frame nested inside tmux's own
+    // DCS passthrough, which does not survive reliably; downgrade to Half
+    // Blocks (a forced ISEE_PROTOCOL=sixel still works for experiments).
+    if tmux && protocol == Protocol::Sixel {
+        protocol = Protocol::HalfBlocks;
+    }
 
     let info = TerminalInfo {
         protocol,
@@ -107,10 +123,13 @@ fn in_tmux() -> bool {
 
 fn isee_override() -> Option<Protocol> {
     let v = env::var("ISEE_PROTOCOL").ok()?.to_ascii_lowercase();
-    if v == "kitty" {
-        Some(Protocol::Kitty)
-    } else {
-        Some(Protocol::HalfBlocks)
+    match v.as_str() {
+        "kitty" => Some(Protocol::Kitty),
+        "iip" => Some(Protocol::Iip),
+        "sixel" => Some(Protocol::Sixel),
+        // "halfblocks" is accepted as an alias; unknown values fall back to
+        // Half Blocks silently, matching the pre-existing behavior.
+        _ => Some(Protocol::HalfBlocks),
     }
 }
 
@@ -405,14 +424,21 @@ pub fn wrap_passthrough(output: &[u8]) -> Vec<u8> {
     out
 }
 
-/// tmux-flavoured output for Kitty protocol: wrap each KGP APC chunk
-/// (`ESC _G ... ESC \`) in its own DCS passthrough (mirroring yazi), while
-/// leaving placeholder text, SGR colours and CRLF untouched so they flow
-/// through tmux's pane grid. The grid is what lets tmux draw the placeholders
-/// at the right pane position and re-draw them on refresh — wrapping them in
-/// passthrough would render the image at the client's stray cursor position
-/// and erase it on the next redraw.
-pub fn wrap_kitty_passthrough(data: &[u8]) -> Vec<u8> {
+/// tmux-flavoured output for bitmap graphics: wrap each transfer frame in its
+/// own DCS passthrough (mirroring yazi), while leaving plain text, SGR
+/// colours and CRLF untouched so they flow through tmux's pane grid. The
+/// grid is what lets tmux draw placeholders/text at the right pane position
+/// and re-draw them on refresh — wrapping them in passthrough would render
+/// the image at the client's stray cursor position and erase it on the next
+/// redraw.
+///
+/// Frame kinds recognized (note their DIFFERENT terminators):
+/// - Kitty APC chunk: `ESC _G ... ESC \`
+/// - iTerm2 inline image: `ESC ]1337;... BEL` — terminated by BEL (0x07),
+///   NOT by ST; matching on ST would swallow the whole block.
+/// - Sixel: `ESC P <digit/;> q ... ESC \` (DCS header like `ESC Pq` or
+///   `ESC P9;1q`).
+pub fn wrap_graphics_passthrough(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 4096);
     let mut i = 0;
     while i < data.len() {
@@ -423,6 +449,28 @@ pub fn wrap_kitty_passthrough(data: &[u8]) -> Vec<u8> {
             out.extend_from_slice(&wrap_passthrough(&data[i..seq_end]));
             i = seq_end;
             continue;
+        }
+        if data[i..].starts_with(b"\x1b]1337;")
+            && let Some(end) = find_sub(&data[i..], b"\x07")
+        {
+            let seq_end = end + 1;
+            out.extend_from_slice(&wrap_passthrough(&data[i..seq_end]));
+            i = seq_end;
+            continue;
+        }
+        if data[i] == 0x1b && data.get(i + 1) == Some(&b'P') {
+            let mut j = i + 2;
+            while j < data.len().min(i + 32) && (data[j].is_ascii_digit() || data[j] == b';') {
+                j += 1;
+            }
+            if data.get(j) == Some(&b'q')
+                && let Some(end) = find_sub(&data[j + 1..], b"\x1b\\")
+            {
+                let seq_end = j + 1 + end + 2;
+                out.extend_from_slice(&wrap_passthrough(&data[i..seq_end]));
+                i = seq_end;
+                continue;
+            }
         }
         out.push(data[i]);
         i += 1;
@@ -468,7 +516,7 @@ mod tests {
         let mut data = b"\x1b_Ga=T,m=0;AA\x1b\\\x1b_Gm=0;BB\x1b\\\x1b[38;2;1;2;3m".to_vec();
         data.extend_from_slice(placeholder.as_bytes());
         data.extend_from_slice(b"\r\n");
-        let out = wrap_kitty_passthrough(&data);
+        let out = wrap_graphics_passthrough(&data);
         // Each APC chunk gets its own passthrough wrapper...
         let chunk1 = wrap_passthrough(b"\x1b_Ga=T,m=0;AA\x1b\\");
         let chunk2 = wrap_passthrough(b"\x1b_Gm=0;BB\x1b\\");
@@ -485,6 +533,44 @@ mod tests {
     fn kitty_wrap_handles_unterminated_apc() {
         // A trailing "\x1b_G" without terminator is copied verbatim.
         let data = b"\x1b_Gbroken";
-        assert_eq!(wrap_kitty_passthrough(data), data);
+        assert_eq!(wrap_graphics_passthrough(data), data);
+    }
+
+    #[test]
+    fn osc1337_frame_wrapped_by_bel() {
+        // The iTerm2 frame ends with BEL (0x07), NOT ST. The trailing CRLFs
+        // that park the cursor must stay outside the wrapper.
+        let mut data =
+            b"\x1b]1337;File=inline=1;size=4;width=2px;height=2px;doNotMoveCursor=1:AAAA\x07"
+                .to_vec();
+        data.extend_from_slice(b"\r\n\r\n");
+        let out = wrap_graphics_passthrough(&data);
+        let wrapped = wrap_passthrough(
+            b"\x1b]1337;File=inline=1;size=4;width=2px;height=2px;doNotMoveCursor=1:AAAA\x07",
+        );
+        let mut expect = wrapped;
+        expect.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(out, expect);
+    }
+
+    #[test]
+    fn sixel_dcs_frames_wrapped() {
+        let heads: [&[u8]; 2] = [b"\x1bPq", b"\x1bP9;1q"];
+        for head in heads {
+            let mut data = head.to_vec();
+            data.extend_from_slice(b"#0;2;100;0;0#0?-$\x1b\\\r\n");
+            let out = wrap_graphics_passthrough(&data);
+            let mut seq = head.to_vec();
+            seq.extend_from_slice(b"#0;2;100;0;0#0?-$\x1b\\");
+            let mut expect = wrap_passthrough(&seq);
+            expect.extend_from_slice(b"\r\n");
+            assert_eq!(out, expect, "head {head:?}");
+        }
+    }
+
+    #[test]
+    fn unterminated_sixel_copied_verbatim() {
+        let data = b"\x1bP9;1qbroken";
+        assert_eq!(wrap_graphics_passthrough(data), data);
     }
 }

@@ -2,20 +2,29 @@ use image::{DynamicImage, GenericImageView};
 
 use crate::detect::{CellPx, WinSize};
 
-/// Scaling bounds for the Kitty protocol, in DEVICE pixels: the physical
-/// cell times the grid. Deriving the bounds and the placeholder grid from
-/// the SAME cell guarantees `ceil(w/cell) <= cols`, so an ultra-wide image
-/// can never wrap its last placeholder column onto the next line.
+/// Scaling bounds for bitmap protocols drawn straight onto the device pixel
+/// grid (Iip/Sixel): the physical cell times the grid, same formula as the
+/// Kitty placeholder grid. These protocols have no placeholder cells to
+/// anchor, but the bound semantics (whole visible text area in device
+/// pixels) are identical.
 ///
 /// The raw window-pixel report (`win.px`) is deliberately NOT used as a
 /// bound: on Ghostty it includes window padding, which can exceed the grid
-/// by a fraction of a cell and push the grid past the last column.
-pub fn kitty_bounds(o: &RenderOpts) -> (u64, u64) {
+/// by a fraction of a cell.
+pub fn bitmap_bounds(o: &RenderOpts) -> (u64, u64) {
     let (cw, ch) = kitty_cell(o);
     (
         (o.win.cols as u64 * cw as u64).max(1),
         (o.win.rows as u64 * ch as u64).max(1),
     )
+}
+
+/// Scaling bounds for the Kitty protocol, in DEVICE pixels: delegates to
+/// `bitmap_bounds` — the placeholder grid must derive from the SAME cell as
+/// the bounds so `ceil(w/cell) <= cols`, and an ultra-wide image can never
+/// wrap its last placeholder column onto the next line.
+pub fn kitty_bounds(o: &RenderOpts) -> (u64, u64) {
+    bitmap_bounds(o)
 }
 
 /// Physical cell size for the Kitty placeholder grid: max() of the probed
@@ -248,6 +257,16 @@ mod tests {
         // A physically-probed cell wins over a logical px report too.
         o.cell = CellPx { w: 19, h: 38 };
         assert_eq!(kitty_cell(&o), (19, 38));
+    }
+
+    #[test]
+    fn bitmap_bounds_match_kitty_bounds() {
+        // Bitmap protocols share the device-pixel bound semantics; the Kitty
+        // bounds are a thin delegate over the same formula.
+        let mut o = opts();
+        assert_eq!(bitmap_bounds(&o), kitty_bounds(&o));
+        o.win.px = Some((1440, 864));
+        assert_eq!(bitmap_bounds(&o), (1440, 864));
     }
 
     #[test]

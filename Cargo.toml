@@ -24,6 +24,8 @@ jpeg-decoder = { version = "0.3.2", default-features = false }
 libc   = "0.2"
 flate2 = "1"
 resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts", "raster-images", "svgz"] }
+palette   = { version = "0.7.7", default-features = false }
+quantette = { version = "0.6.0", default-features = false }
 
 [profile.release]
 opt-level = 3
