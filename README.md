@@ -13,7 +13,7 @@ for terminals without graphics support.
 ## Usage
 
 ```
-isee [OPTIONS] [IMGPATH]
+isee [OPTIONS] [IMGPATH ...]
 ```
 
 If `IMGPATH` is omitted, image data is read from `stdin`.
