@@ -675,4 +675,66 @@ mod tests {
         assert!(m.profile.is_none());
         assert!(!m.alpha_hint);
     }
+
+    // ---- JPEG ICC_PROFILE multi-segment reassembly ----
+
+    /// Minimal v2 ICC whose 'desc' tag names a unique profile, so reassembly
+    /// is validated end to end (segment join + zlib-free icc_desc parse).
+    fn split_icc_profile() -> Vec<u8> {
+        let text = b"Split Profile XY";
+        let mut tag = b"desc".to_vec();
+        tag.extend_from_slice(&[0; 4]);
+        push_u32(&mut tag, text.len() as u32 + 1);
+        tag.extend_from_slice(text);
+        tag.push(0);
+        let mut prof = vec![0u8; 128];
+        push_u32(&mut prof, 1); // tag count
+        push_u32(&mut prof, 0x64657363); // 'desc'
+        push_u32(&mut prof, 144); // body offset: header + one table entry
+        push_u32(&mut prof, tag.len() as u32);
+        prof.extend_from_slice(&tag);
+        prof
+    }
+
+    fn icc_app2(seq: u8, count: u8, part: &[u8]) -> Vec<u8> {
+        let mut seg = b"ICC_PROFILE\0".to_vec();
+        seg.push(seq);
+        seg.push(count);
+        seg.extend_from_slice(part);
+        let mut d = vec![0xFF, 0xE2];
+        push_u16(&mut d, seg.len() as u16 + 2);
+        d.extend_from_slice(&seg);
+        d
+    }
+
+    #[test]
+    fn jpeg_icc_segments_reassembled_regardless_of_file_order() {
+        // Real encoders may emit APP2 chunks out of order or readers may see
+        // them split; the seq byte must drive the join.
+        let prof = split_icc_profile();
+        let mid = prof.len() / 2;
+        let mut d = b"\xff\xd8".to_vec();
+        d.extend_from_slice(&icc_app2(1, 2, &prof[mid..])); // later half first
+        d.extend_from_slice(&icc_app2(0, 2, &prof[..mid]));
+        d.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02]); // SOS terminates scan
+        assert_eq!(
+            extract(&d).profile.as_deref(),
+            Some("Split Profile XY"),
+            "sequence numbers must order the joined profile"
+        );
+    }
+
+    #[test]
+    fn jpeg_icc_partial_profile_is_skipped_silently() {
+        // Only one of two announced segments present: never panic, just no
+        // profile name (mirrors extract()'s malformed-data contract).
+        let prof = split_icc_profile();
+        let mid = prof.len() / 2;
+        let mut d = b"\xff\xd8".to_vec();
+        d.extend_from_slice(&icc_app2(0, 2, &prof[..mid]));
+        d.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02]);
+        let m = extract(&d);
+        assert_eq!(m.profile, None);
+        assert!(!m.alpha_hint);
+    }
 }
