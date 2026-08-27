@@ -92,10 +92,11 @@ pub fn render(img: &DynamicImage, o: &RenderOpts) -> Vec<u8> {
     out.extend_from_slice(b"\x1b\\");
 
     // Some terminals move below the image on their own; emitting one CRLF per
-    // device-cell row (same rule as Iip) may add one blank line there, but is
-    // the only way to keep the prompt clear on the terminals that do not.
-    let (_, ch) = size::kitty_cell(o);
-    let rows = (h as f64 / ch as f64).ceil().max(1.0) as u32;
+    // LOGICAL cell row (same rule as Iip — Sixel pixels are rendered one per
+    // logical point) may add one blank line there, but is the only way to
+    // keep the prompt clear on the terminals that do not.
+    let ch = o.cell.h;
+    let rows = (h as f64 / ch.max(1) as f64).ceil().max(1.0) as u32;
     for _ in 0..rows {
         out.extend_from_slice(b"\r\n");
     }
@@ -137,6 +138,7 @@ mod tests {
                 rows: 24,
                 px: None,
             },
+            dpy_scale: 1,
         }
     }
 
@@ -199,5 +201,17 @@ mod tests {
         let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(3, 3, Rgb([1, 2, 3])));
         let out = render(&img, &opts());
         assert!(out.ends_with(b"\r\n"));
+        // HiDPI: the row count must divide by the logical cell (10), not
+        // kitty_cell's doubled height (36) — a 20px image spans 2 rows.
+        let mut o = opts();
+        o.cell = CellPx { w: 5, h: 10 };
+        o.win.px = Some((720, 864));
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 20, Rgb([1, 2, 3])));
+        let out = render(&img, &o);
+        assert_eq!(
+            String::from_utf8_lossy(&out).matches("\r\n").count(),
+            2,
+            "2 logical cell rows expected"
+        );
     }
 }

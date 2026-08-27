@@ -37,23 +37,18 @@ pub fn render(img: &DynamicImage, o: &RenderOpts) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len() * 2 + 128);
     write!(
         out,
-        "\x1b]1337;File=inline=1;size={};width={w}px;height={h}px;doNotMoveCursor=1:",
+        "\x1b]1337;File=inline=1;size={};width={w}px;height={h}px:",
         payload.len()
     )
     .unwrap();
     out.extend_from_slice(crate::b64::base64_encode(&payload).as_bytes());
     // The frame terminator is BEL (0x07), NOT ST.
     out.push(0x07);
-
-    // yazi draws inside a TUI grid and never scrolls; a CLI must instead push
-    // the cursor below the image so the shell prompt lands cleanly under it.
-    // One CRLF per device-pixel cell row mirrors what the Kitty placeholder
-    // grid occupies (`size::kitty_cell` is the HiDPI-corrected height).
-    let (_, ch) = size::kitty_cell(o);
-    let rows = (h as f64 / ch as f64).ceil().max(1.0) as u32;
-    for _ in 0..rows {
-        out.extend_from_slice(b"\r\n");
-    }
+    // No `doNotMoveCursor=1`: the terminal moves the cursor below the image
+    // on its own and one newline parks the shell prompt on the next line —
+    // exactly what imgcat does. yazi needs doNotMoveCursor because a TUI
+    // re-draws its grid in place; a CLI preview does not.
+    out.extend_from_slice(b"\n");
     out
 }
 
@@ -72,6 +67,7 @@ mod tests {
                 rows: 24,
                 px: None,
             },
+            dpy_scale: 1,
         }
     }
 
@@ -101,7 +97,11 @@ mod tests {
         // First four payload bytes are 0x89 'P' 'N' 'G' -> base64 starts "iVBOR".
         assert!(b64_payload.starts_with("iVBOR"), "{b64_payload}");
         assert_eq!(out[hdr_end], 0x07);
-        assert!(out.ends_with(b"\r\n"));
+        assert!(out.ends_with(b"\n"));
+        assert!(!out.ends_with(b"\r\n"));
+        // No doNotMoveCursor: the terminal advances the cursor itself, like
+        // it does for imgcat.
+        assert!(!s.contains("doNotMoveCursor"));
     }
 
     #[test]
@@ -117,21 +117,14 @@ mod tests {
     }
 
     #[test]
-    fn trailing_crlfs_match_device_cell_rows() {
-        // 18px tall with 18px device cells => exactly 2 rows of CRLF.
+    fn trailing_newline_parks_prompt_below_image() {
+        // The terminal advances the cursor past the image itself (imgcat
+        // semantics); a single newline puts the prompt on the next line.
         let img = DynamicImage::new_rgb8(4, 36);
         let out = render(&img, &opts());
         let s = String::from_utf8_lossy(&out);
         let after = s.split_once('\u{7}').unwrap().1;
-        assert_eq!(after.matches("\r\n").count(), 2);
-        assert_eq!(after, "\r\n\r\n");
-
-        // A sub-cell-tall image still parks at least one line below.
-        let img = DynamicImage::new_rgb8(4, 10);
-        let out = render(&img, &opts());
-        let s = String::from_utf8_lossy(&out);
-        let after = s.split_once('\u{7}').unwrap().1;
-        assert_eq!(after, "\r\n");
+        assert_eq!(after, "\n");
     }
 
     #[test]
@@ -141,7 +134,7 @@ mod tests {
         let img = DynamicImage::new_rgb8(5, 5);
         let out = render(&img, &o);
         let s = String::from_utf8_lossy(&out);
-        assert!(s.contains(";width=20px;height=20px;"), "{s}");
+        assert!(s.contains(";width=20px;height=20px:"), "{s}");
     }
 
     #[test]
@@ -158,7 +151,7 @@ mod tests {
             &opts(),
         );
         assert!(!a.is_empty() && !b.is_empty());
-        assert!(a.ends_with(b"\r\n") && b.ends_with(b"\r\n"));
+        assert!(a.ends_with(b"\n") && b.ends_with(b"\n"));
         assert!(a.starts_with(b"\x1b]1337;") && b.starts_with(b"\x1b]1337;"));
     }
 }

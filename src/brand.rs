@@ -82,24 +82,29 @@ pub fn detect(lookup: impl Fn(&str) -> Option<String>) -> Option<Brand> {
 }
 
 /// The preferred bitmap protocol for a brand, following yazi's driver table
-/// (drivers.rs) minus drivers this tool does not implement:
-/// - Iip is the first pick for iTerm2/Warp/mintty/VSCode/Tabby/Hyper/Bobcat.
+/// minus drivers this tool does not implement:
+/// - Iip is the first pick for iTerm2/Warp/mintty/VSCode/Tabby/Bobcat
+///   (VSCode additionally needs `terminal.integrated.enableImages: true`,
+///   which is off by default — until enabled it just shows garbage-free text).
 /// - Foot/Windows Terminal/BlackBox speak Sixel.
 /// - Konsole only ships the legacy KGP snapshot here, which we do not
 ///   implement either, so it maps straight to Sixel (a deliberate deviation).
 /// - Kitty-family/Ghostty/Rio stay None and ride the dedicated KGP probe in
 ///   detect(). WezTerm also stays on KGP although yazi prefers Iip: the KGP
 ///   path is already proven working there.
+/// - Hyper is None although yazi lists Iip first: its xterm.js base has no
+///   OSC 1337 renderer at all (the official imgcat script fails too, tested
+///   2026-08), and nothing we can encode fixes that. The variant is kept so
+///   upstream support is a one-line change away.
 pub fn preferred_protocol(b: Brand) -> Option<Protocol> {
     match b {
-        Brand::KittyFamily | Brand::Ghostty | Brand::WezTerm | Brand::Rio => None,
+        Brand::KittyFamily | Brand::Ghostty | Brand::WezTerm | Brand::Rio | Brand::Hyper => None,
         Brand::Konsole | Brand::Foot | Brand::Microsoft | Brand::BlackBox => Some(Protocol::Sixel),
         Brand::Warp
         | Brand::Iterm2
         | Brand::Mintty
         | Brand::Vscode
         | Brand::Tabby
-        | Brand::Hyper
         | Brand::Bobcat => Some(Protocol::Iip),
         Brand::Apple | Brand::Urxvt | Brand::Unknown => None,
     }
@@ -178,12 +183,14 @@ mod tests {
     #[test]
     fn preferred_protocol_table() {
         use crate::detect::Protocol;
-        // Kitty-family terminals ride the existing KGP probe instead.
+        // Kitty-family terminals ride the existing KGP probe instead; Hyper
+        // has no OSC 1337 renderer at all (see preferred_protocol).
         for b in [
             Brand::KittyFamily,
             Brand::Ghostty,
             Brand::WezTerm,
             Brand::Rio,
+            Brand::Hyper,
             Brand::Unknown,
             Brand::Apple,
             Brand::Urxvt,
@@ -204,7 +211,6 @@ mod tests {
             Brand::Mintty,
             Brand::Vscode,
             Brand::Tabby,
-            Brand::Hyper,
             Brand::Bobcat,
         ] {
             assert_eq!(preferred_protocol(b), Some(Protocol::Iip), "{b:?}");

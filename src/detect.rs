@@ -34,6 +34,9 @@ pub struct TerminalInfo {
     pub cell: CellPx,
     pub win: WinSize,
     pub tmux: bool,
+    /// Device pixels per logical point for the bitmap protocols, from the
+    /// window-pixel report (or `ISEE_DPI_SCALE`). 1 when unknowable.
+    pub dpy_scale: u32,
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -96,21 +99,30 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
         protocol = Protocol::HalfBlocks;
     }
 
+    let win = win_size(stdout_fd);
+    // Default 1 = native-px semantics, matching imgcat exactly: iTerm2/Warp
+    // render one declared px as one logical point and auto-fit oversized
+    // images to the window. `ISEE_DPI_SCALE=2` opts into point sizing (the
+    // bitmap is halved so a Retina screenshot shows at QuickLook size).
+    let dpy_scale = isee_dpi_scale().unwrap_or(1);
+
     let info = TerminalInfo {
         protocol,
         cell,
-        win: win_size(stdout_fd),
+        win,
         tmux,
+        dpy_scale,
     };
     if env::var("ISEE_DEBUG").is_ok() {
         eprintln!(
-            "isee: protocol={:?} cell={}x{} win={}x{} px={:?} tmux={}",
+            "isee: protocol={:?} cell={}x{} win={}x{} px={:?} scale={} tmux={}",
             info.protocol,
             info.cell.w,
             info.cell.h,
             info.win.cols,
             info.win.rows,
             info.win.px,
+            info.dpy_scale,
             tmux
         );
     }
@@ -130,6 +142,16 @@ fn isee_override() -> Option<Protocol> {
         // "halfblocks" is accepted as an alias; unknown values fall back to
         // Half Blocks silently, matching the pre-existing behavior.
         _ => Some(Protocol::HalfBlocks),
+    }
+}
+
+/// `ISEE_DPI_SCALE=1|2` forces the bitmap display scale; unset, "auto", or
+/// any other value keeps the default 1 (native-px, imgcat-matching).
+fn isee_dpi_scale() -> Option<u32> {
+    match env::var("ISEE_DPI_SCALE").ok()?.trim() {
+        "1" => Some(1),
+        "2" => Some(2),
+        _ => None,
     }
 }
 

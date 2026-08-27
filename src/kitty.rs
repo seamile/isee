@@ -420,6 +420,7 @@ mod tests {
                 rows: 24,
                 px: None,
             },
+            dpy_scale: 1,
         }
     }
 

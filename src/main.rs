@@ -142,6 +142,14 @@ fn run_preview(
         quality: args.quality,
         cell: term.cell,
         win: term.win,
+        // Bitmap protocols declare sizes in logical points: feed them the
+        // terminal's device-pixel scale so previews shrink to point size on
+        // Retina. Kitty works in device pixels and Half Blocks in cell
+        // units, so both stay at 1.
+        dpy_scale: match term.protocol {
+            Protocol::Iip | Protocol::Sixel => term.dpy_scale,
+            Protocol::Kitty | Protocol::HalfBlocks => 1,
+        },
     };
     let bounds = match term.protocol {
         Protocol::Kitty => size::kitty_bounds(&opts),
@@ -190,12 +198,12 @@ fn run_preview(
 }
 
 /// Stream one preview image to `out`, flushing nothing itself. A single image
-/// emits no path title; only Half Blocks gets a trailing newline (Kitty/Iip/
-/// Sixel blocks already end by moving the cursor off the image themselves).
-/// Multiple images precede each image with its original path and separate it
-/// from the previous one by exactly one blank line. `wrote_before` reflects
-/// whether an earlier image was already emitted, so a failed file never
-/// blocks later ones.
+/// emits no path title; Kitty/Sixel blocks move the cursor off the image
+/// themselves and Iip ends with its own newline, so only Half Blocks needs a
+/// trailing newline added. Multiple images precede each image with its
+/// original path and separate it from the previous one by exactly one blank
+/// line. `wrote_before` reflects whether an earlier image was already
+/// emitted, so a failed file never blocks later ones.
 fn emit_preview_item(
     out: &mut dyn Write,
     multi: bool,

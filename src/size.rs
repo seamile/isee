@@ -2,29 +2,34 @@ use image::{DynamicImage, GenericImageView};
 
 use crate::detect::{CellPx, WinSize};
 
-/// Scaling bounds for bitmap protocols drawn straight onto the device pixel
-/// grid (Iip/Sixel): the physical cell times the grid, same formula as the
-/// Kitty placeholder grid. These protocols have no placeholder cells to
-/// anchor, but the bound semantics (whole visible text area in device
-/// pixels) are identical.
+/// Scaling bounds for bitmap protocols drawn by the terminal itself
+/// (Iip/Sixel), in LOGICAL pixels: the probed/logical cell times the grid.
+/// OSC 1337's `width/height=Npx` and Sixel bitmaps are rendered by iTerm2,
+/// Warp & co at one image pixel per logical point (unlike KGP, which maps an
+/// image pixel to a device pixel on HiDPI screens), so feeding device-pixel
+/// sizes here doubles the visible height on Retina. yazi uses the same
+/// logical-cell convention for both drivers.
+pub fn bitmap_bounds(o: &RenderOpts) -> (u64, u64) {
+    (
+        (o.win.cols as u64 * o.cell.w.max(1) as u64).max(1),
+        (o.win.rows as u64 * o.cell.h.max(1) as u64).max(1),
+    )
+}
+
+/// Scaling bounds for the Kitty protocol, in DEVICE pixels: the physical
+/// cell times the grid. The placeholder grid derives from this same cell so
+/// `ceil(w/cell) <= cols`, and an ultra-wide image can never wrap its last
+/// placeholder column onto the next line.
 ///
 /// The raw window-pixel report (`win.px`) is deliberately NOT used as a
 /// bound: on Ghostty it includes window padding, which can exceed the grid
 /// by a fraction of a cell.
-pub fn bitmap_bounds(o: &RenderOpts) -> (u64, u64) {
+pub fn kitty_bounds(o: &RenderOpts) -> (u64, u64) {
     let (cw, ch) = kitty_cell(o);
     (
         (o.win.cols as u64 * cw as u64).max(1),
         (o.win.rows as u64 * ch as u64).max(1),
     )
-}
-
-/// Scaling bounds for the Kitty protocol, in DEVICE pixels: delegates to
-/// `bitmap_bounds` — the placeholder grid must derive from the SAME cell as
-/// the bounds so `ceil(w/cell) <= cols`, and an ultra-wide image can never
-/// wrap its last placeholder column onto the next line.
-pub fn kitty_bounds(o: &RenderOpts) -> (u64, u64) {
-    bitmap_bounds(o)
 }
 
 /// Physical cell size for the Kitty placeholder grid: max() of the probed
@@ -55,6 +60,12 @@ pub struct RenderOpts {
     pub quality: Quality,
     pub cell: CellPx,
     pub win: WinSize,
+    /// Device pixels per logical point for the bitmap protocols (Iip/Sixel).
+    /// Their sizes are declared in logical points, so on a Retina screen an
+    /// undeclared-size image would show twice as large unless the bitmap
+    /// itself shrinks to point size first. Kitty (device pixels) and Half
+    /// Blocks (cell units) always use 1.
+    pub dpy_scale: u32,
 }
 
 /// Preview quality tier mapped to a resize filter:
@@ -146,6 +157,7 @@ mod tests {
                 rows: 24,
                 px: None,
             },
+            dpy_scale: 1,
         }
     }
 
@@ -260,13 +272,18 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_bounds_match_kitty_bounds() {
-        // Bitmap protocols share the device-pixel bound semantics; the Kitty
-        // bounds are a thin delegate over the same formula.
+    fn bitmap_bounds_stay_logical_on_hidpi() {
+        // Without a px report both bounds formulas degenerate to the same
+        // logical grid...
         let mut o = opts();
         assert_eq!(bitmap_bounds(&o), kitty_bounds(&o));
+        assert_eq!(bitmap_bounds(&o), (720, 432));
+        // ...but on HiDPI only the KITTY bounds double: OSC 1337 and Sixel
+        // render one image pixel per logical point, so their bounds must
+        // stay at the logical cell (9x18), not the physical one (18x36).
         o.win.px = Some((1440, 864));
-        assert_eq!(bitmap_bounds(&o), (1440, 864));
+        assert_eq!(kitty_bounds(&o), (1440, 864));
+        assert_eq!(bitmap_bounds(&o), (720, 432));
     }
 
     #[test]

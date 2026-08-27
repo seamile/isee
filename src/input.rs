@@ -101,21 +101,52 @@ fn decode_full(buf: &[u8]) -> Result<(DynamicImage, ColorType), Box<dyn std::err
 /// decoding (`jpeg-decoder`), avoiding a full-resolution raster and the
 /// resulting peak memory. Everything else, and any JPEG the DCT path declines,
 /// falls through to the regular `image` reader.
+///
+/// `dpy_scale` is the bitmap display scale (device px per logical point):
+/// when > 1 (Retina Iip/Sixel), every target is computed in point space and
+/// the decoded bitmap shrinks to point size so the declared `height=Npx`
+/// renders at the image's natural visual size (see `shrink_to_points`).
 fn decode_for_preview(
     buf: &[u8],
     opts: &RenderOpts,
     bounds: (u64, u64),
+    dpy_scale: u32,
 ) -> Result<DynamicImage, Box<dyn std::error::Error>> {
     if is_svg(buf) {
-        return decode_svg(buf);
+        let img = decode_svg(buf)?;
+        return Ok(shrink_to_points(img, dpy_scale, opts, bounds));
     }
     if is_jpeg(buf)
-        && let Some(img) = decode_jpeg_scaled(buf, opts, bounds)?
+        && let Some(img) = decode_jpeg_scaled(buf, opts, bounds, dpy_scale)?
     {
         return Ok(img);
     }
     let (img, _) = decode_full(buf)?;
-    Ok(img)
+    Ok(shrink_to_points(img, dpy_scale, opts, bounds))
+}
+
+/// Shrink a decoded bitmap to its point size for scaled displays, opting in
+/// via `ISEE_DPI_SCALE=2`. Default (`dpy_scale` 1) declares the native pixel
+/// size, which iTerm2/Warp render at 1px = 1pt and auto-fit to the window —
+/// exactly imgcat's behavior. With scale 2 the bitmap halves first so a
+/// Retina screenshot shows at QuickLook size (one source pixel per device
+/// pixel after the terminal's 1pt = 2 device-px render). `-w` applies in
+/// point space afterwards, then the bounds cap.
+fn shrink_to_points(
+    img: DynamicImage,
+    dpy_scale: u32,
+    opts: &RenderOpts,
+    bounds: (u64, u64),
+) -> DynamicImage {
+    if dpy_scale <= 1 {
+        return img;
+    }
+    let (iw, ih) = (img.width(), img.height());
+    let (tw, th) = size::target_dims(iw.div_ceil(dpy_scale), ih.div_ceil(dpy_scale), opts, bounds);
+    if (tw, th) == (iw, ih) {
+        return img;
+    }
+    img.resize(tw, th, size::filter(opts.quality))
 }
 
 fn is_jpeg(buf: &[u8]) -> bool {
@@ -130,6 +161,7 @@ fn decode_jpeg_scaled(
     buf: &[u8],
     opts: &RenderOpts,
     bounds: (u64, u64),
+    dpy_scale: u32,
 ) -> Result<Option<DynamicImage>, Box<dyn std::error::Error>> {
     let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(buf));
     if decoder.read_info().is_err() {
@@ -145,6 +177,10 @@ fn decode_jpeg_scaled(
     let raw_h = info.height as u32;
     let orientation = read_orientation(buf);
     let (ow, oh) = oriented_dims(raw_w, raw_h, orientation);
+    // Targets live in point space on scaled displays: divide first so the DCT
+    // pre-scale matches the point-space preview (the render resize finishes
+    // the job when DCT's discrete ratios overshoot).
+    let (ow, oh) = (ow.div_ceil(dpy_scale), oh.div_ceil(dpy_scale));
     let (tw, th) = size::target_dims(ow, oh, opts, bounds);
     // Only bother when the preview is meaningfully smaller than the source.
     if tw >= ow && th >= oh {
@@ -395,7 +431,7 @@ pub fn load(
     bounds: (u64, u64),
 ) -> Result<Loaded, Box<dyn std::error::Error>> {
     let buf = read_all(source)?;
-    let img = decode_for_preview(&buf, opts, bounds)?;
+    let img = decode_for_preview(&buf, opts, bounds, opts.dpy_scale)?;
     Ok(Loaded { img })
 }
 
@@ -517,6 +553,7 @@ mod tests {
                 rows: 50,
                 px: None,
             },
+            dpy_scale: 1,
         }
     }
 
@@ -578,7 +615,7 @@ mod tests {
         let o = opts_width(Some(240));
         let bounds = (100_000u64, 100_000u64);
         assert_eq!(size::target_dims(1200, 600, &o, bounds), (240, 120));
-        let img = decode_jpeg_scaled(&jpeg, &o, bounds)
+        let img = decode_jpeg_scaled(&jpeg, &o, bounds, 1)
             .unwrap()
             .expect("scaled");
         assert_eq!((img.width(), img.height()), (300, 150));
@@ -591,7 +628,7 @@ mod tests {
         let jpeg = encode_jpeg_gray(1200, 600);
         let o = opts_width(Some(240));
         let bounds = (100_000u64, 100_000u64);
-        let img = decode_jpeg_scaled(&jpeg, &o, bounds)
+        let img = decode_jpeg_scaled(&jpeg, &o, bounds, 1)
             .unwrap()
             .expect("scaled");
         assert_eq!((img.width(), img.height()), (300, 150));
@@ -604,7 +641,7 @@ mod tests {
         let jpeg = encode_jpeg(100, 50);
         let o = opts_width(None);
         let bounds = (100_000u64, 100_000u64);
-        assert!(decode_jpeg_scaled(&jpeg, &o, bounds).unwrap().is_none());
+        assert!(decode_jpeg_scaled(&jpeg, &o, bounds, 1).unwrap().is_none());
     }
 
     #[test]
@@ -616,7 +653,7 @@ mod tests {
         let o = opts_width(Some(240));
         let bounds = (100_000u64, 100_000u64);
         assert_eq!(size::target_dims(600, 1200, &o, bounds), (240, 480));
-        let img = decode_jpeg_scaled(&jpeg, &o, bounds)
+        let img = decode_jpeg_scaled(&jpeg, &o, bounds, 1)
             .unwrap()
             .expect("scaled");
         assert_eq!(
@@ -633,15 +670,84 @@ mod tests {
         let bounds = (100_000u64, 100_000u64);
         // JPEG goes through DCT scaling.
         let jpeg = encode_jpeg(1200, 600);
-        let scaled = decode_for_preview(&jpeg, &o, bounds).unwrap();
+        let scaled = decode_for_preview(&jpeg, &o, bounds, 1).unwrap();
         assert_eq!((scaled.width(), scaled.height()), (300, 150));
         // PNG never uses DCT scaling: a full decode, exact resize is done later.
         let mut png = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(1200, 600))
             .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
-        let full = decode_for_preview(&png, &o, bounds).unwrap();
+        let full = decode_for_preview(&png, &o, bounds, 1).unwrap();
         assert_eq!((full.width(), full.height()), (1200, 600));
+    }
+
+    // ---- bitmap display scale (Retina Iip/Sixel point sizing) ----
+
+    fn encode_png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(w, h))
+            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn dpy_scale_shrinks_bitmap_to_point_size() {
+        // A 400x300 image on a scale-2 terminal must become a 200x150 bitmap:
+        // declared as 200x150px it renders 200x150pt = 400x300 device px,
+        // the natural imgcat-sized result, instead of the doubled 300pt.
+        let png = encode_png(400, 300);
+        let o = opts_width(None);
+        let bounds = (10_000u64, 10_000u64);
+        let img = decode_for_preview(&png, &o, bounds, 2).unwrap();
+        assert_eq!((img.width(), img.height()), (200, 150));
+    }
+
+    #[test]
+    fn dpy_scale_one_keeps_native_size() {
+        let png = encode_png(400, 300);
+        let o = opts_width(None);
+        let bounds = (10_000u64, 10_000u64);
+        let img = decode_for_preview(&png, &o, bounds, 1).unwrap();
+        assert_eq!((img.width(), img.height()), (400, 300));
+    }
+
+    #[test]
+    fn dpy_scale_width_request_applies_in_point_space() {
+        // -w 800 means 800 logical points on a scale-2 display: the bitmap is
+        // upscaled from the 200pt natural size to an 800pt-wide one.
+        let png = encode_png(400, 300);
+        let mut o = opts_width(Some(800));
+        o.win = crate::detect::WinSize {
+            cols: 400,
+            rows: 100,
+            px: None,
+        }; // point bounds 3600x1800 leave room for the upscale
+        let bounds = (3_600u64, 1_800u64);
+        let img = decode_for_preview(&png, &o, bounds, 2).unwrap();
+        assert_eq!((img.width(), img.height()), (800, 600));
+    }
+
+    #[test]
+    fn dpy_scale_bounds_cap_survives_scaling() {
+        // The point bounds still cap: a 400x300 image at scale 2 with a
+        // 100x50-point window shrinks further to fit (100x75).
+        let png = encode_png(400, 300);
+        let o = opts_width(None);
+        let bounds = (100u64, 50u64);
+        let img = decode_for_preview(&png, &o, bounds, 2).unwrap();
+        assert_eq!((img.width(), img.height()), (67, 50));
+    }
+
+    #[test]
+    fn jpeg_dct_target_uses_point_space() {
+        // 1200x600 at scale 2 behaves like a 600x300 source: no -w keeps it
+        // at its point size (600x300), via DCT pre-scaling.
+        let jpeg = encode_jpeg(1200, 600);
+        let o = opts_width(None);
+        let bounds = (10_000u64, 10_000u64);
+        let img = decode_for_preview(&jpeg, &o, bounds, 2).unwrap();
+        assert_eq!((img.width(), img.height()), (600, 300));
     }
 
     #[test]
@@ -726,12 +832,12 @@ mod tests {
         let jpeg = encode_jpeg(12001, 60);
         let o = opts_width(Some(240));
         let bounds = (100_000u64, 100_000u64);
-        let img = decode_jpeg_scaled(&jpeg, &o, bounds)
+        let img = decode_jpeg_scaled(&jpeg, &o, bounds, 1)
             .unwrap()
             .expect("DCT must scale an oversized JPEG");
         assert!(img.width() < 12001, "DCT must not keep full width");
         assert!(img.width() >= 240 && img.height() >= 1);
-        assert!(decode_for_preview(&jpeg, &o, bounds).is_ok());
+        assert!(decode_for_preview(&jpeg, &o, bounds, 1).is_ok());
     }
 
     #[test]
