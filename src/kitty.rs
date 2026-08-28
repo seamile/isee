@@ -10,13 +10,22 @@ use crate::size::{self, RenderOpts};
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 
-/// Prototype zlib-compressed KGP transfer, gated on `ISEE_KGP_COMPRESS`:
-/// raw RGBA payloads (~2.9 MB for a 900x600 image) dominate the sys time
-/// spent pushing frames into the pty. `o=z` asks the terminal to
-/// zlib-decompress the payload after transfer; the format stays `f=32`, so
-/// `s`/`v` and the placeholder grid are untouched.
+/// zlib-compressed KGP transfer, ON by default, opt out via
+/// `ISEE_KGP_COMPRESS=0` (also `false`/`no`/`off`, case-insensitive): raw
+/// RGBA payloads (~2.9 MB for a 900x600 image) dominate the wall time a
+/// terminal spends consuming frames — on Ghostty, compression cut a
+/// 103-image batch from ~31 s to ~18 s for ~3 s extra CPU. `o=z` asks the
+/// terminal to zlib-decompress the payload after transfer; the format stays
+/// `f=32`, so `s`/`v` and the placeholder grid are untouched.
 fn kgp_compress_enabled(v: Option<&str>) -> bool {
-    matches!(v, Some(s) if s == "1" || s.eq_ignore_ascii_case("true"))
+    !matches!(
+        v,
+        Some(s)
+            if s == "0"
+                || s.eq_ignore_ascii_case("false")
+                || s.eq_ignore_ascii_case("no")
+                || s.eq_ignore_ascii_case("off")
+    )
 }
 
 /// Kitty's Unicode-placeholder mechanism matches a cell to an image by the
@@ -29,6 +38,11 @@ pub fn new_image_id() -> u32 {
 }
 
 pub fn render(img: &DynamicImage, o: &RenderOpts, id: u32) -> Vec<u8> {
+    let compress = kgp_compress_enabled(std::env::var("ISEE_KGP_COMPRESS").ok().as_deref());
+    render_with(img, o, id, compress)
+}
+
+fn render_with(img: &DynamicImage, o: &RenderOpts, id: u32, compress: bool) -> Vec<u8> {
     let (tw, th) = size::target_px(img, o, size::kitty_bounds(o));
     let rgba = if tw == img.width() && th == img.height() {
         img.to_rgba8()
@@ -44,13 +58,7 @@ pub fn render(img: &DynamicImage, o: &RenderOpts, id: u32) -> Vec<u8> {
     let cols = (w as f64 / cw as f64).ceil().max(1.0) as u32;
     let rows = (h as f64 / ch as f64).ceil().max(1.0) as u32;
 
-    let mut out = encode(
-        &rgba,
-        w,
-        h,
-        id,
-        kgp_compress_enabled(std::env::var("ISEE_KGP_COMPRESS").ok().as_deref()),
-    );
+    let mut out = encode(&rgba, w, h, id, compress);
     place(&mut out, cols, rows, id);
     out
 }
@@ -459,12 +467,17 @@ mod tests {
 
     #[test]
     fn compress_flag_parsing() {
-        assert!(!kgp_compress_enabled(None));
-        assert!(!kgp_compress_enabled(Some("0")));
-        assert!(!kgp_compress_enabled(Some("")));
+        // Default is ON; only explicit falsy values opt out.
+        assert!(kgp_compress_enabled(None));
+        assert!(kgp_compress_enabled(Some("")));
         assert!(kgp_compress_enabled(Some("1")));
         assert!(kgp_compress_enabled(Some("true")));
         assert!(kgp_compress_enabled(Some("TRUE")));
+        assert!(!kgp_compress_enabled(Some("0")));
+        assert!(!kgp_compress_enabled(Some("false")));
+        assert!(!kgp_compress_enabled(Some("False")));
+        assert!(!kgp_compress_enabled(Some("no")));
+        assert!(!kgp_compress_enabled(Some("off")));
     }
 
     #[test]
@@ -492,7 +505,7 @@ mod tests {
     #[test]
     fn control_uses_placeholder_without_cr() {
         let img = DynamicImage::new_rgba8(2, 1);
-        let out = render(&img, &opts(), 42);
+        let out = render_with(&img, &opts(), 42, false);
         let s = String::from_utf8_lossy(&out);
         assert!(
             s.starts_with("\x1b_Ga=T,C=1,U=1,f=32,s=2,v=1,i=42,q=2,m=0;"),
@@ -512,7 +525,7 @@ mod tests {
         let mut o = opts();
         o.win.px = Some((1440, 864));
         let img = DynamicImage::new_rgba8(982, 548);
-        let out = render(&img, &o, 42);
+        let out = render_with(&img, &o, 42, false);
         let s = String::from_utf8_lossy(&out);
         // Native size fits the 1440x864 bounds; grid ceil(982/18) x ceil(548/36).
         assert!(
@@ -543,7 +556,7 @@ mod tests {
         // 400x300 px with 9x18 cell must NOT be snapped to a whole-cell size
         // (396x306 or 405x306): s/v report the real RGBA dimensions.
         let img = DynamicImage::new_rgba8(400, 300);
-        let out = render(&img, &opts(), 42);
+        let out = render_with(&img, &opts(), 42, false);
         let s = String::from_utf8_lossy(&out);
         assert!(
             s.starts_with("\x1b_Ga=T,C=1,U=1,f=32,s=400,v=300,i=42,q=2,m=1;"),
