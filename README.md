@@ -4,7 +4,7 @@ A small utility for previewing images in the terminal.
 
 `isee` detects the terminal's image protocol at runtime and renders the image
 with the **Kitty graphics protocol** (with Unicode placeholder cells for
-precise sizing), **Iip** (iTerm2 OSC 1337 inline file: Warp, iTerm2, mintty,
+precise sizing), **IIP** (iTerm2 OSC 1337 inline file: Warp, iTerm2, mintty,
 Tabby, and VSCode — the latter needs `terminal.integrated.enableImages: true`),
 or **Sixel** (Foot, Konsole, Windows Terminal,
 BlackBox). Terminals without graphics support fall back to **Half Blocks**
@@ -96,16 +96,23 @@ cat /foo/bar/image.jpg | isee
   devices-pixels. Without `-w`, the image is shown at its native pixel size and
   only shrunk to fit the terminal; with `-w` it is scaled to that width.
 
-- **Bitmap display scale (Iip/Sixel on Retina)** — OSC 1337 and Sixel sizes
-  are declared in *logical points* (the terminal renders 1px = 1pt and
-  auto-fits oversized images to the window). By default isee declares the
-  image's native pixel size — exactly what `imgcat` does, so a 1920x1080
-  image fills the window and a small image shows at its natural point size.
-  `ISEE_DPI_SCALE=2` opts into point sizing instead: the bitmap is halved
-  before encoding so a Retina screenshot (400x300 px = 200x150 pt) shows at
-  its QuickLook size rather than doubled; `ISEE_DPI_SCALE=1` forces the
-  default explicitly. On scaled displays `-w` counts in logical points for
-  these protocols.
+- **Bitmap display scale (IIP/Sixel on Retina)** — Bitmap bounds follow the
+  terminal's *logical* grid (yazi's convention: one declared px = one
+  logical point), and oversized images are auto-fitted to the window. How a
+  declared size actually renders is brand-dependent (measured fullscreen on
+  a 2x Retina display): Sixel terminals and Warp draw one image px per
+  logical point, while iTerm2 draws one image px per *device* pixel and so
+  shows the same file twice as wide (isee's bounds stay logical for both
+  drivers — exact on Warp, conservative 2x on iTerm2 whose auto-fit clamps
+  the result). By default isee declares the image's native pixel size —
+  exactly what `imgcat` does, so a 1920x1080 image fills the window and a
+  small image shows at its natural point size. `ISEE_DPI_SCALE=2` opts into
+  point sizing instead: the bitmap is halved before encoding so a Retina
+  screenshot (400x300 px = 200x150 pt) shows at its QuickLook size rather
+  than doubled — that is the QuickLook intent on Warp, but on iTerm2 it
+  halves again (there, `-w` at twice the width gives QuickLook size);
+  `ISEE_DPI_SCALE=1` forces the default explicitly. On scaled displays `-w`
+  counts in logical points for these protocols.
 
 - **Kitty rendering** — The image is uploaded as a sequence of 4096-byte chunked
   APC frames. A grid of Unicode placeholder cells is then drawn at the exact
@@ -113,7 +120,7 @@ cat /foo/bar/image.jpg | isee
   the APC transfer frames are wrapped in passthrough; the placeholder cells go
   through the tmux grid so they land in the right pane and survive redraws.
 
-- **Iip rendering** — Terminals speaking iTerm2's OSC 1337 inline-file protocol
+- **IIP rendering** — Terminals speaking iTerm2's OSC 1337 inline-file protocol
   (Warp, iTerm2, mintty, Tabby, and VSCode with
   `terminal.integrated.enableImages: true`) receive the resized image
   base64-encoded in one frame — PNG for alpha images, JPEG q85 otherwise.
