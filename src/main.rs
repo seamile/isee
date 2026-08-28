@@ -158,43 +158,135 @@ fn run_preview(
     };
 
     let mut out = stdout.lock();
+
+    // Multiple files: decode on a small worker pool while the main thread
+    // emits blocks strictly in input order. Single file (and stdin) keeps
+    // the plain serial path below.
+    if multi {
+        return preview_parallel(sources, &term, &opts, bounds, &mut out);
+    }
+
     let mut wrote_before = false;
-    let mut failed = 0usize;
     for source in sources {
         let path = display_source(source);
         match input::load(source, &opts, bounds) {
             Ok(loaded) => {
-                let mut block = match term.protocol {
-                    Protocol::Kitty => kitty::render(&loaded.img, &opts, kitty::new_image_id()),
-                    Protocol::Iip => iip::render(&loaded.img, &opts),
-                    Protocol::Sixel => sixel::render(&loaded.img, &opts),
-                    Protocol::HalfBlocks => halfblock::render(&loaded.img, &opts).into_bytes(),
-                };
-                // Sixel is downgraded to Half Blocks at detect() time (nested
-                // DCS escaping does not survive tmux), so only Kitty APC
-                // chunks and Iip OSC frames get the passthrough treatment.
-                if term.tmux && matches!(term.protocol, Protocol::Kitty | Protocol::Iip) {
-                    block = detect::wrap_graphics_passthrough(&block);
-                }
+                let block = render_block(&loaded.img, &term, &opts);
                 emit_preview_item(&mut out, multi, term.protocol, wrote_before, &path, &block)
                     .map_err(|e| AppErr::Fatal(e.to_string()))?;
                 out.flush().map_err(|e| AppErr::Fatal(e.to_string()))?;
                 wrote_before = true;
             }
-            Err(e) => {
-                if !multi {
-                    return Err(AppErr::Fatal(e.to_string()));
-                }
-                eprintln!("isee: {path}: {e}");
-                failed += 1;
-            }
+            Err(e) => return Err(AppErr::Fatal(e.to_string())),
         }
     }
-    if failed > 0 {
-        Err(AppErr::Fatal(failure_summary(failed)))
-    } else {
-        Ok(())
+    Ok(())
+}
+
+/// Render a loaded image to a protocol frame (plus tmux DCS passthrough
+/// wrapping when needed). Pure function of (img, term, opts): safe to call
+/// from worker threads.
+fn render_block(
+    img: &image::DynamicImage,
+    term: &detect::TerminalInfo,
+    opts: &size::RenderOpts,
+) -> Vec<u8> {
+    let mut block = match term.protocol {
+        Protocol::Kitty => kitty::render(img, opts, kitty::new_image_id()),
+        Protocol::Iip => iip::render(img, opts),
+        Protocol::Sixel => sixel::render(img, opts),
+        Protocol::HalfBlocks => halfblock::render(img, opts).into_bytes(),
+    };
+    // Sixel is downgraded to Half Blocks at detect() time (nested
+    // DCS escaping does not survive tmux), so only Kitty APC
+    // chunks and Iip OSC frames get the passthrough treatment.
+    if term.tmux && matches!(term.protocol, Protocol::Kitty | Protocol::Iip) {
+        block = detect::wrap_graphics_passthrough(&block);
     }
+    block
+}
+
+/// Worker count for multi-file previews. Each worker holds at most one
+/// decoded block, so peak memory stays at ~4 preview blocks.
+const PREVIEW_WORKERS: usize = 4;
+
+/// Multi-file preview pipeline: `PREVIEW_WORKERS` threads decode + render
+/// concurrently (JPEG/PNG entropy decoding dominates the runtime and does
+/// not parallelize internally), while the main thread writes blocks strictly
+/// in input order with a flush after each one, preserving the sequential
+/// preview contract. A failed image is reported on stderr at its original
+/// position without blocking the rest; write errors (e.g. EPIPE) stop the
+/// pipeline promptly.
+fn preview_parallel(
+    sources: &[input::Source],
+    term: &detect::TerminalInfo,
+    opts: &size::RenderOpts,
+    bounds: (u64, u64),
+    out: &mut dyn Write,
+) -> Result<(), AppErr> {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    let next = AtomicUsize::new(0);
+    let stop = AtomicUsize::new(0);
+    let workers = sources.len().min(PREVIEW_WORKERS).max(1);
+    let (tx, rx) = mpsc::channel::<(usize, String, Result<Vec<u8>, String>)>();
+
+    std::thread::scope(|scope| -> Result<(), AppErr> {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if stop.load(Ordering::Relaxed) != 0 {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= sources.len() {
+                    break;
+                }
+                let path = display_source(&sources[i]);
+                let res = input::load(&sources[i], opts, bounds)
+                    .map_err(|e| e.to_string())
+                    .map(|loaded| render_block(&loaded.img, term, opts));
+                if tx.send((i, path, res)).is_err() {
+                    break;
+                }
+            });
+        }
+
+        // Reorder worker output by input index: hold early finishers until
+        // every predecessor has been emitted.
+        let mut pending: BTreeMap<usize, (String, Result<Vec<u8>, String>)> = BTreeMap::new();
+        let mut expect = 0usize;
+        let mut wrote_before = false;
+        let mut failed = 0usize;
+        while expect < sources.len() {
+            let Ok((i, path, res)) = rx.recv() else {
+                break;
+            };
+            pending.insert(i, (path, res));
+            while let Some((path, res)) = pending.remove(&expect) {
+                match res {
+                    Ok(block) => {
+                        emit_preview_item(out, true, term.protocol, wrote_before, &path, &block)
+                            .map_err(|e| AppErr::Fatal(e.to_string()))?;
+                        out.flush().map_err(|e| AppErr::Fatal(e.to_string()))?;
+                        wrote_before = true;
+                    }
+                    Err(e) => {
+                        eprintln!("isee: {path}: {e}");
+                        failed += 1;
+                    }
+                }
+                expect += 1;
+            }
+        }
+        // Stop idle workers promptly on early exit (e.g. EPIPE from `head`).
+        stop.store(1, Ordering::Relaxed);
+        if failed > 0 {
+            return Err(AppErr::Fatal(failure_summary(failed)));
+        }
+        Ok(())
+    })
 }
 
 /// Stream one preview image to `out`, flushing nothing itself. A single image
