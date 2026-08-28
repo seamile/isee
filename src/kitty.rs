@@ -1,12 +1,23 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use image::DynamicImage;
 
 use crate::b64::base64_encode;
 use crate::size::{self, RenderOpts};
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Prototype zlib-compressed KGP transfer, gated on `ISEE_KGP_COMPRESS`:
+/// raw RGBA payloads (~2.9 MB for a 900x600 image) dominate the sys time
+/// spent pushing frames into the pty. `o=z` asks the terminal to
+/// zlib-decompress the payload after transfer; the format stays `f=32`, so
+/// `s`/`v` and the placeholder grid are untouched.
+fn kgp_compress_enabled(v: Option<&str>) -> bool {
+    matches!(v, Some(s) if s == "1" || s.eq_ignore_ascii_case("true"))
+}
 
 /// Kitty's Unicode-placeholder mechanism matches a cell to an image by the
 /// cell's foreground color, which encodes only 24 bits. The id must therefore
@@ -33,22 +44,36 @@ pub fn render(img: &DynamicImage, o: &RenderOpts, id: u32) -> Vec<u8> {
     let cols = (w as f64 / cw as f64).ceil().max(1.0) as u32;
     let rows = (h as f64 / ch as f64).ceil().max(1.0) as u32;
 
-    let mut out = encode(&rgba, w, h, id);
+    let mut out = encode(
+        &rgba,
+        w,
+        h,
+        id,
+        kgp_compress_enabled(std::env::var("ISEE_KGP_COMPRESS").ok().as_deref()),
+    );
     place(&mut out, cols, rows, id);
     out
 }
 
-fn encode(rgba: &image::RgbaImage, w: u32, h: u32, id: u32) -> Vec<u8> {
-    let b64 = base64_encode(rgba.as_raw());
+fn encode(rgba: &image::RgbaImage, w: u32, h: u32, id: u32, compress: bool) -> Vec<u8> {
+    let b64 = if compress {
+        // Speed-first: the point is fewer pty bytes, not a minimal archive.
+        let mut z = ZlibEncoder::new(Vec::new(), Compression::fast());
+        z.write_all(rgba.as_raw()).unwrap();
+        base64_encode(&z.finish().unwrap())
+    } else {
+        base64_encode(rgba.as_raw())
+    };
     const CHUNK: usize = 4096;
     let total = b64.len().div_ceil(CHUNK);
     let mut out: Vec<u8> = Vec::with_capacity(b64.len() + 64 * total);
+    let opts = if compress { ",o=z" } else { "" };
     for (i, chunk) in b64.as_bytes().chunks(CHUNK).enumerate() {
         let more = i + 1 < total;
         if i == 0 {
             write!(
                 out,
-                "\x1b_Ga=T,C=1,U=1,f=32,s={w},v={h},i={id},q=2,m={m};",
+                "\x1b_Ga=T,C=1,U=1,f=32,s={w},v={h},i={id},q=2{opts},m={m};",
                 m = if more { 1 } else { 0 }
             )
             .unwrap();
@@ -430,6 +455,38 @@ mod tests {
             let id = new_image_id();
             assert!(id < 0xffffff, "id {id} exceeds 24 bits");
         }
+    }
+
+    #[test]
+    fn compress_flag_parsing() {
+        assert!(!kgp_compress_enabled(None));
+        assert!(!kgp_compress_enabled(Some("0")));
+        assert!(!kgp_compress_enabled(Some("")));
+        assert!(kgp_compress_enabled(Some("1")));
+        assert!(kgp_compress_enabled(Some("true")));
+        assert!(kgp_compress_enabled(Some("TRUE")));
+    }
+
+    #[test]
+    fn compressed_transfer_declares_o_z_and_keeps_f32() {
+        let img = DynamicImage::new_rgba8(2, 1);
+        let out = encode(&img.to_rgba8(), 2, 1, 42, true);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.starts_with("\x1b_Ga=T,C=1,U=1,f=32,s=2,v=1,i=42,q=2,o=z,m=0;"),
+            "got {s}"
+        );
+    }
+
+    #[test]
+    fn uncompressed_transfer_has_no_o_z() {
+        let img = DynamicImage::new_rgba8(2, 1);
+        let out = encode(&img.to_rgba8(), 2, 1, 42, false);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.starts_with("\x1b_Ga=T,C=1,U=1,f=32,s=2,v=1,i=42,q=2,m=0;"),
+            "got {s}"
+        );
     }
 
     #[test]
