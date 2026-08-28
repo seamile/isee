@@ -8,6 +8,7 @@ pub struct Args {
     pub width: Option<u32>,
     pub quality: Quality,
     pub info: bool,
+    pub animate: bool,
     pub paths: Vec<PathBuf>,
 }
 
@@ -49,6 +50,8 @@ Options:
   -q QUALITY Preview scaling quality: L (nearest), M (triangle), H (lanczos);
              default M
   -i         Show image information
+  -a         Animate GIFs where the terminal supports it (kitty; iTerm2,
+             mintty), else fall back to the first frame
   -v         Print version
   -h, --help Print help
 ";
@@ -73,6 +76,7 @@ where
             "-h" | "--help" => return Err(ParseError::Help),
             "-v" => return Err(ParseError::Version),
             "-i" => out.info = true,
+            "-a" | "--animate" => out.animate = true,
             "-w" => {
                 let v = it.next().ok_or(ParseError::MissingValue("-w"))?;
                 out.width = Some(parse_num("-w", &v)?);

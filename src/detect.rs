@@ -43,6 +43,9 @@ pub struct TerminalInfo {
     /// (iTerm2's OSC 1337 ReportCellSize is the only known source).
     /// Informational for now: rendering still keys off `dpy_scale`.
     pub probed_scale: Option<f32>,
+    /// Env-recognized terminal brand (see `brand::detect`); gates
+    /// brand-specific behavior such as the Iip GIF-animation whitelist.
+    pub brand: Option<crate::brand::Brand>,
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -138,6 +141,7 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
         tmux,
         dpy_scale,
         probed_scale,
+        brand,
     };
     if env::var("ISEE_DEBUG").is_ok() {
         eprintln!(

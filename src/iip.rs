@@ -52,6 +52,27 @@ pub fn render(img: &DynamicImage, o: &RenderOpts) -> Vec<u8> {
     out
 }
 
+/// Render an animated GIF for terminals that play OSC 1337 GIF payloads
+/// themselves (iTerm2, mintty): the raw GIF bytes pass through as one inline
+/// file with no re-encode, declared at the first frame's preview size
+/// (`decode_gif` already sized the frames, so `target_px` is idempotent).
+/// Same frame layout and BEL terminator as the static path.
+pub fn render_gif_raw(raw: &[u8], o: &RenderOpts, first: &DynamicImage) -> Vec<u8> {
+    let (w, h) = size::target_px(first, o, size::bitmap_bounds(o));
+    let mut out = Vec::with_capacity(raw.len() * 2 + 128);
+    write!(
+        out,
+        "\x1b]1337;File=inline=1;size={};width={w}px;height={h}px:",
+        raw.len()
+    )
+    .unwrap();
+    out.extend_from_slice(crate::b64::base64_encode(raw).as_bytes());
+    // The frame terminator is BEL (0x07), NOT ST.
+    out.push(0x07);
+    out.extend_from_slice(b"\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +174,23 @@ mod tests {
         assert!(!a.is_empty() && !b.is_empty());
         assert!(a.ends_with(b"\n") && b.ends_with(b"\n"));
         assert!(a.starts_with(b"\x1b]1337;") && b.starts_with(b"\x1b]1337;"));
+    }
+
+    #[test]
+    fn gif_raw_passthrough_declares_first_frame_size() {
+        // The raw GIF bytes go out untouched; only the declared w/h come from
+        // the first (already preview-sized) frame.
+        let raw: &[u8] = b"GIF89a-not-really-an-animated-gif";
+        let first = DynamicImage::new_rgba8(6, 4);
+        let out = render_gif_raw(raw, &opts(), &first);
+        assert!(out.starts_with(b"\x1b]1337;File=inline=1;size="), "{out:?}");
+        let s = String::from_utf8_lossy(&out);
+        assert_eq!(declared_size(&s), raw.len());
+        assert!(s.contains(";width=6px;height=4px:"), "{s}");
+        let b64_start = s.find(':').unwrap() + 1;
+        let hdr_end = s.find('\u{7}').unwrap();
+        assert_eq!(&s[b64_start..hdr_end], crate::b64::base64_encode(raw));
+        assert_eq!(out[hdr_end], 0x07);
+        assert!(out.ends_with(b"\n"));
     }
 }

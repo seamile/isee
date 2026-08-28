@@ -1,9 +1,11 @@
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::PathBuf;
+use std::time::Duration;
 
-use image::metadata::Orientation;
-use image::{ColorType, DynamicImage, ImageDecoder, ImageReader};
+use image::codecs::gif::GifDecoder;
+use image::metadata::{LoopCount, Orientation};
+use image::{AnimationDecoder, ColorType, DynamicImage, ImageDecoder, ImageReader};
 use jpeg_decoder::PixelFormat;
 
 use crate::meta;
@@ -34,6 +36,19 @@ const PREVIEW_MAX_DIMENSION: u32 = 12_000;
 const PREVIEW_MAX_ALLOC: u64 = 384 * 1024 * 1024;
 /// Maximum pixel count allowed when rasterizing an SVG preview.
 const SVG_MAX_PIXELS: u64 = 16 * 1024 * 1024;
+/// Maximum cumulative retained-frame budget for an animation decode. Frames
+/// live for the whole preview (a static bitmap is freed after resizing), so
+/// the guard is tighter than `PREVIEW_MAX_ALLOC` and counts the resized
+/// canvases actually kept. Exceeding it truncates the clip at a frame
+/// boundary rather than failing the preview.
+const ANIM_MAX_ALLOC: u64 = 192 * 1024 * 1024;
+/// Hard cap on retained animation frames, guarding pathological clips whose
+/// byte budget stays small (tiny canvases with a huge frame count).
+const ANIM_MAX_FRAMES: usize = 4096;
+/// Minimum gap advertised to the terminal: the kitty animation protocol
+/// ignores a zero gap (substituting its 40 ms default), so a genuinely fast
+/// GIF reports 1 ms instead.
+const ANIM_MIN_DELAY_MS: u32 = 1;
 
 /// `image` decode limits guarding the interactive preview. The `-i` info path
 /// (`load_info`) and the JPEG DCT downscale path are intentionally excluded:
@@ -151,6 +166,12 @@ fn shrink_to_points(
 
 fn is_jpeg(buf: &[u8]) -> bool {
     buf.len() >= 2 && buf[0] == 0xFF && buf[1] == 0xD8
+}
+
+/// Detect a GIF by its 6-byte signature (`GIF87a` / `GIF89a`), before any
+/// decode, so the animation path can be gated on `-a`.
+fn is_gif(buf: &[u8]) -> bool {
+    buf.starts_with(b"GIF87a") || buf.starts_with(b"GIF89a")
 }
 
 /// Decode a JPEG with DCT downscaling when it is much larger than the preview
@@ -421,18 +442,110 @@ fn decode_svg(buf: &[u8]) -> Result<DynamicImage, Box<dyn std::error::Error>> {
     Ok(DynamicImage::ImageRgba8(img))
 }
 
-pub struct Loaded {
-    pub img: DynamicImage,
+/// A loaded preview source: one static image, or an animated GIF with every
+/// frame decoded (opted in via `-a`).
+pub enum Loaded {
+    Static(DynamicImage),
+    Gif(GifAnimation),
 }
 
 pub fn load(
     source: &Source,
     opts: &RenderOpts,
     bounds: (u64, u64),
+    animate: bool,
 ) -> Result<Loaded, Box<dyn std::error::Error>> {
     let buf = read_all(source)?;
+    if animate
+        && is_gif(&buf)
+        && let Ok(anim) = decode_gif(&buf, opts, bounds, opts.dpy_scale)
+    {
+        return Ok(Loaded::Gif(anim));
+    }
     let img = decode_for_preview(&buf, opts, bounds, opts.dpy_scale)?;
-    Ok(Loaded { img })
+    Ok(Loaded::Static(img))
+}
+
+/// A single composited animation frame, resized to the shared preview target.
+pub struct AnimFrame {
+    pub img: DynamicImage,
+    /// Gap to the next frame in whole milliseconds (at least 1).
+    pub delay_ms: u32,
+}
+
+/// An animated GIF: composited full-canvas frames plus the loop count from
+/// the file's Netscape extension. The original bytes are kept so terminals
+/// that animate GIFs themselves (OSC 1337) can pass the file through
+/// unmodified.
+pub struct GifAnimation {
+    pub raw: Vec<u8>,
+    pub frames: Vec<AnimFrame>,
+    pub loop_count: LoopCount,
+}
+
+/// Decode an animated GIF into composited full-canvas frames (`GifDecoder`
+/// blends each frame onto the logical screen itself) resized to one shared
+/// preview target, so every frame reports identical dimensions. The first
+/// frame must pass the regular preview size/alloc checks; retained frames
+/// must fit `ANIM_MAX_ALLOC` / `ANIM_MAX_FRAMES`, otherwise the clip is
+/// truncated at a frame boundary. Fewer than two frames — or a mid-stream
+/// failure before reaching two — is an error so the caller falls back to the
+/// static path.
+fn decode_gif(
+    buf: &[u8],
+    opts: &RenderOpts,
+    bounds: (u64, u64),
+    dpy_scale: u32,
+) -> Result<GifAnimation, Box<dyn std::error::Error>> {
+    // The GIF signature was verified by the caller (`is_gif`), so no format
+    // guessing is needed; `GifDecoder::new` takes the reader directly.
+    let decoder = GifDecoder::new(Cursor::new(buf))?;
+    let loop_count = decoder.loop_count();
+    let mut frames: Vec<AnimFrame> = Vec::new();
+    let mut target = (0, 0);
+    let mut budget: u64 = 0;
+    for res in decoder.into_frames() {
+        let frame = match res {
+            Ok(frame) => frame,
+            Err(err) => {
+                if frames.len() >= 2 {
+                    break; // keep whatever decoded cleanly so far
+                }
+                return Err(err.into());
+            }
+        };
+        let (w, h) = (frame.buffer().width(), frame.buffer().height());
+        if frames.is_empty() {
+            check_preview_size(w, h)?;
+            check_preview_alloc(w, h, frame.buffer().len() as u64)?;
+            // One shared point-space target on scaled displays (the same rule
+            // as `shrink_to_points`), keeping all frames mutually consistent.
+            let (pw, ph) = (w.div_ceil(dpy_scale), h.div_ceil(dpy_scale));
+            target = size::target_dims(pw, ph, opts, bounds);
+        }
+        let cost = u64::from(target.0) * u64::from(target.1) * 4;
+        if frames.len() >= ANIM_MAX_FRAMES || (!frames.is_empty() && budget + cost > ANIM_MAX_ALLOC)
+        {
+            break; // truncation at a frame boundary
+        }
+        let delay_ms = u32::try_from(Duration::from(frame.delay()).as_millis())
+            .unwrap_or(u32::MAX)
+            .max(ANIM_MIN_DELAY_MS);
+        let mut img = DynamicImage::ImageRgba8(frame.into_buffer());
+        if (w, h) != target {
+            img = img.resize_exact(target.0, target.1, size::filter(opts.quality));
+        }
+        budget += cost;
+        frames.push(AnimFrame { img, delay_ms });
+    }
+    if frames.len() < 2 {
+        return Err("GIF has fewer than two frames".into());
+    }
+    Ok(GifAnimation {
+        raw: buf.to_vec(),
+        frames,
+        loop_count,
+    })
 }
 
 pub struct ImageInfo {
@@ -850,5 +963,139 @@ mod tests {
         assert_eq!(info.width, 12001);
         assert_eq!(info.height, 60);
         assert_eq!(info.size, jpeg.len() as u64);
+    }
+
+    // ---- GIF animation ----
+
+    use image::codecs::gif::{GifEncoder, Repeat};
+
+    fn anim_frame(w: u32, h: u32, rgb: [u8; 3], delay_cs: u16) -> image::Frame {
+        let mut img = image::RgbaImage::new(w, h);
+        for px in img.pixels_mut() {
+            *px = image::Rgba([rgb[0], rgb[1], rgb[2], 255]);
+        }
+        image::Frame::from_parts(
+            img,
+            0,
+            0,
+            // numer/denom is in milliseconds (cs*10 over 1 = the centisecond
+            // GIF delay), NOT numerator-over-1000.
+            image::Delay::from_numer_denom_ms(u32::from(delay_cs) * 10, 1),
+        )
+    }
+
+    fn encode_gif(frames: &[image::Frame], repeat: Repeat) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut out);
+            enc.set_repeat(repeat).unwrap();
+            for f in frames {
+                enc.encode_frame(f.clone()).unwrap();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn detects_gif_signature() {
+        assert!(is_gif(b"GIF89a\x01\x00\x01\x00"));
+        assert!(is_gif(b"GIF87a\x01\x00\x01\x00"));
+        assert!(!is_gif(b"GIF98a\x01\x00\x01\x00"));
+        assert!(!is_gif(b""));
+        assert!(!is_gif(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn decode_gif_extracts_composited_frames_and_loop_count() {
+        let frames = [
+            anim_frame(4, 4, [255, 0, 0], 5),
+            anim_frame(4, 4, [0, 255, 0], 20),
+            anim_frame(4, 4, [0, 0, 255], 100),
+        ];
+        let buf = encode_gif(&frames, Repeat::Finite(2));
+        let o = opts_width(None);
+        let bounds = (10_000u64, 10_000u64);
+        let anim = decode_gif(&buf, &o, bounds, 1).unwrap();
+        assert_eq!(anim.frames.len(), 3);
+        let delays: Vec<u32> = anim.frames.iter().map(|f| f.delay_ms).collect();
+        assert_eq!(delays, vec![50, 200, 1000]);
+        for f in &anim.frames {
+            assert_eq!(f.img.color(), ColorType::Rgba8);
+            assert_eq!((f.img.width(), f.img.height()), (4, 4));
+        }
+        if let LoopCount::Finite(n) = anim.loop_count {
+            assert_eq!(n.get(), 2);
+        } else {
+            panic!("expected a finite loop count");
+        }
+        assert_eq!(anim.raw, buf);
+    }
+
+    #[test]
+    fn decode_gif_resizes_all_frames_to_shared_target() {
+        let frames = [
+            anim_frame(40, 20, [255, 0, 0], 5),
+            anim_frame(40, 20, [0, 255, 0], 10),
+        ];
+        let buf = encode_gif(&frames, Repeat::Infinite);
+        let o = opts_width(Some(20));
+        let bounds = (100_000u64, 100_000u64);
+        let anim = decode_gif(&buf, &o, bounds, 1).unwrap();
+        assert_eq!(anim.frames.len(), 2);
+        for f in &anim.frames {
+            assert_eq!((f.img.width(), f.img.height()), (20, 10));
+        }
+    }
+
+    #[test]
+    fn decode_gif_with_single_frame_errors_for_static_fallback() {
+        let buf = encode_gif(&[anim_frame(4, 4, [1, 2, 3], 5)], Repeat::Infinite);
+        let o = opts_width(None);
+        let bounds = (10_000u64, 10_000u64);
+        let Err(err) = decode_gif(&buf, &o, bounds, 1) else {
+            panic!("expected an error for a single-frame GIF");
+        };
+        assert!(
+            err.to_string().contains("fewer than two frames"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn decode_gif_clamps_zero_delay_to_one_ms() {
+        // A zero gap must never hit the wire: kitty ignores z=0 and would
+        // fall back to its 40 ms default.
+        let frames = [
+            anim_frame(4, 4, [255, 0, 0], 0),
+            anim_frame(4, 4, [0, 255, 0], 0),
+        ];
+        let buf = encode_gif(&frames, Repeat::Infinite);
+        let o = opts_width(None);
+        let bounds = (10_000u64, 10_000u64);
+        let anim = decode_gif(&buf, &o, bounds, 1).unwrap();
+        for f in &anim.frames {
+            assert_eq!(f.delay_ms, 1);
+        }
+    }
+
+    #[test]
+    fn load_returns_gif_only_when_animate_requested() {
+        let frames = [
+            anim_frame(4, 4, [255, 0, 0], 5),
+            anim_frame(4, 4, [0, 255, 0], 5),
+        ];
+        let buf = encode_gif(&frames, Repeat::Infinite);
+        let path = std::env::temp_dir().join(format!("isee_gif_{}.gif", std::process::id()));
+        std::fs::write(&path, &buf).unwrap();
+        let o = opts_width(None);
+        let bounds = (10_000u64, 10_000u64);
+        let without_flag = load(&Source::Path(path.clone()), &o, bounds, false).unwrap();
+        assert!(matches!(without_flag, Loaded::Static(_)));
+        let with_flag = load(&Source::Path(path.clone()), &o, bounds, true).unwrap();
+        let Loaded::Gif(anim) = with_flag else {
+            panic!("expected an animated load with -a");
+        };
+        assert_eq!(anim.frames.len(), 2);
+        let _ = std::fs::remove_file(&path);
     }
 }

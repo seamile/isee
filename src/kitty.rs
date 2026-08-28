@@ -4,8 +4,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use image::DynamicImage;
+use image::metadata::LoopCount;
 
 use crate::b64::base64_encode;
+use crate::input::AnimFrame;
 use crate::size::{self, RenderOpts};
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(0);
@@ -63,37 +65,118 @@ fn render_with(img: &DynamicImage, o: &RenderOpts, id: u32, compress: bool) -> V
     out
 }
 
+/// Render an animated GIF for kitty: the first composited frame is
+/// transmitted as the animation's root image (`a=T`) and anchored with the
+/// regular placeholder grid, every remaining frame follows as an `a=f`
+/// full-canvas frame carrying its own gap, and the animation is started with
+/// `a=a`. The root frame's gap defaults to zero, so it is set explicitly
+/// (`r=1`, the root is frame 1) before the start control.
+pub fn render_animation(
+    frames: &[AnimFrame],
+    loop_count: LoopCount,
+    o: &RenderOpts,
+    id: u32,
+) -> Vec<u8> {
+    let compress = kgp_compress_enabled(std::env::var("ISEE_KGP_COMPRESS").ok().as_deref());
+    render_animation_with(frames, loop_count, o, id, compress)
+}
+
+fn render_animation_with(
+    frames: &[AnimFrame],
+    loop_count: LoopCount,
+    o: &RenderOpts,
+    id: u32,
+    compress: bool,
+) -> Vec<u8> {
+    // decode_gif already resized every frame to the shared preview target,
+    // so target_px on the first frame is idempotent: no per-frame resize.
+    let first = frames[0].img.to_rgba8();
+    let (w, h) = first.dimensions();
+    // Grid of cells that will hold the placeholder (device-pixel cell, see
+    // `render_with`); only anchors placement, it does NOT re-scale frames.
+    let (cw, ch) = size::kitty_cell(o);
+    let cols = (w as f64 / cw as f64).ceil().max(1.0) as u32;
+    let rows = (h as f64 / ch as f64).ceil().max(1.0) as u32;
+
+    let mut out = encode(&first, w, h, id, compress);
+    place(&mut out, cols, rows, id);
+    write!(
+        out,
+        "\x1b_Ga=a,i={id},q=2,r=1,z={}\x1b\\",
+        frames[0].delay_ms
+    )
+    .unwrap();
+    // s=3 runs the animation normally; v=1 loops infinitely and v=N plays
+    // N-1 times, so a GIF asking for n loops maps to n+1.
+    let v = match loop_count {
+        LoopCount::Infinite => 1,
+        LoopCount::Finite(n) => n.get().saturating_add(1),
+    };
+    write!(out, "\x1b_Ga=a,i={id},q=2,s=3,v={v}\x1b\\").unwrap();
+    // The canvas of every frame is fully composited (GIF frames arrive as
+    // complete pictures), so `X=1` (simple overwrite) reproduces it exactly;
+    // the default alpha blend would double-blend semi-transparent pixels.
+    let opts = if compress { ",o=z" } else { "" };
+    for frame in &frames[1..] {
+        let b64 = z64(&frame.img.to_rgba8(), compress);
+        write_chunked(
+            &mut out,
+            &b64,
+            &format!(
+                "a=f,f=32,s={w},v={h},i={id},q=2,X=1{opts},z={}",
+                frame.delay_ms
+            ),
+            "a=f",
+        );
+    }
+    out
+}
+
 fn encode(rgba: &image::RgbaImage, w: u32, h: u32, id: u32, compress: bool) -> Vec<u8> {
-    let b64 = if compress {
+    let b64 = z64(rgba, compress);
+    let opts = if compress { ",o=z" } else { "" };
+    let mut out = Vec::with_capacity(b64.len() + 64 * b64.len().div_ceil(CHUNK_BYTES));
+    write_chunked(
+        &mut out,
+        &b64,
+        &format!("a=T,C=1,U=1,f=32,s={w},v={h},i={id},q=2{opts}"),
+        "",
+    );
+    out
+}
+
+const CHUNK_BYTES: usize = 4096;
+
+/// zlib-compressed (or raw) RGBA payload as base64, shared by the static and
+/// animation transfer paths.
+fn z64(rgba: &image::RgbaImage, compress: bool) -> String {
+    if compress {
         // Speed-first: the point is fewer pty bytes, not a minimal archive.
         let mut z = ZlibEncoder::new(Vec::new(), Compression::fast());
         z.write_all(rgba.as_raw()).unwrap();
         base64_encode(&z.finish().unwrap())
     } else {
         base64_encode(rgba.as_raw())
-    };
-    const CHUNK: usize = 4096;
-    let total = b64.len().div_ceil(CHUNK);
-    let mut out: Vec<u8> = Vec::with_capacity(b64.len() + 64 * total);
-    let opts = if compress { ",o=z" } else { "" };
-    for (i, chunk) in b64.as_bytes().chunks(CHUNK).enumerate() {
-        let more = i + 1 < total;
+    }
+}
+
+/// Split `b64` into escape-code payload blocks of at most 4096 bytes, writing
+/// `first` as the control keys of the opening block and re-issuing the keys
+/// in `cont` on every later block (empty means the bare `m=` continuation).
+fn write_chunked(out: &mut Vec<u8>, b64: &str, first: &str, cont: &str) {
+    let total = b64.len().div_ceil(CHUNK_BYTES);
+    for (i, chunk) in b64.as_bytes().chunks(CHUNK_BYTES).enumerate() {
+        let more = if i + 1 < total { 1 } else { 0 };
         if i == 0 {
-            write!(
-                out,
-                "\x1b_Ga=T,C=1,U=1,f=32,s={w},v={h},i={id},q=2{opts},m={m};",
-                m = if more { 1 } else { 0 }
-            )
-            .unwrap();
+            write!(out, "\x1b_G{first},m={more};").unwrap();
+        } else if cont.is_empty() {
+            write!(out, "\x1b_Gm={more};").unwrap();
         } else {
-            out.extend_from_slice(b"\x1b_Gm=");
-            out.push(if more { b'1' } else { b'0' });
-            out.push(b';');
+            write!(out, "\x1b_G{cont},m={more};").unwrap();
         }
         out.extend_from_slice(chunk);
         out.extend_from_slice(b"\x1b\\");
     }
-    out
 }
 
 /// Anchor the transmitted image to a grid of terminal cells. The foreground
@@ -590,5 +673,94 @@ mod tests {
             }
         }
         assert!(s.ends_with("\x1b[0m\r\n"));
+    }
+
+    // ---- GIF animation ----
+
+    fn anim_frame(w: u32, h: u32, delay_ms: u32) -> AnimFrame {
+        AnimFrame {
+            img: DynamicImage::new_rgba8(w, h),
+            delay_ms,
+        }
+    }
+
+    #[test]
+    fn animation_transmits_root_then_frames_and_starts() {
+        let frames = [
+            anim_frame(8, 4, 70),
+            anim_frame(8, 4, 30),
+            anim_frame(8, 4, 10),
+        ];
+        let out = render_animation_with(&frames, LoopCount::Infinite, &opts(), 42, false);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.starts_with("\x1b_Ga=T,C=1,U=1,f=32,s=8,v=4,i=42,q=2,m="),
+            "root frame first: {s}"
+        );
+        assert!(
+            s.contains("\x1b_Ga=a,i=42,q=2,r=1,z=70\x1b\\"),
+            "root frame gap: {s}"
+        );
+        assert!(
+            s.contains("\x1b_Ga=a,i=42,q=2,s=3,v=1\x1b\\"),
+            "start control: {s}"
+        );
+        assert!(
+            s.contains("\x1b_Ga=f,f=32,s=8,v=4,i=42,q=2,X=1,z=30,m=0;"),
+            "second frame: {s}"
+        );
+        assert!(
+            s.contains("\x1b_Ga=f,f=32,s=8,v=4,i=42,q=2,X=1,z=10,m=0;"),
+            "third frame: {s}"
+        );
+        assert_eq!(s.matches("\x1b_Ga=f,f=32").count(), 2);
+        // 1 root a=T + 2 a=a controls + 2 a=f frames.
+        assert_eq!(s.matches("\x1b_G").count(), 5);
+        // 8x4 with a 9x18 cell fits in a single placeholder cell.
+        assert_eq!(s.matches('\u{10EEEE}').count(), 1);
+    }
+
+    #[test]
+    fn animation_loop_count_maps_to_kitty_v() {
+        // Finite(n) plays n times; kitty v=N plays N-1 times, so n -> n+1.
+        let frames = [anim_frame(8, 4, 50), anim_frame(8, 4, 50)];
+        let out = render_animation_with(
+            &frames,
+            LoopCount::Finite(std::num::NonZeroU32::new(2).unwrap()),
+            &opts(),
+            7,
+            false,
+        );
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b_Ga=a,i=7,q=2,s=3,v=3\x1b\\"), "{s}");
+    }
+
+    #[test]
+    fn animation_frame_chunks_carry_a_f_on_continuation() {
+        let frames = [anim_frame(40, 20, 50), anim_frame(40, 20, 50)];
+        let out = render_animation_with(&frames, LoopCount::Infinite, &opts(), 9, false);
+        let s = String::from_utf8_lossy(&out);
+        // 40x20 RGBA = 3200 B -> 4268 base64 chars -> two blocks under the
+        // 4096-byte cap, and every later block must re-declare a=f.
+        assert!(
+            s.contains("a=f,f=32,s=40,v=20,i=9,q=2,X=1,z=50,m=1;"),
+            "first block: {s}"
+        );
+        assert!(s.contains("\x1b_Ga=f,m=0;"), "continuation block: {s}");
+    }
+
+    #[test]
+    fn animation_compressed_frames_declare_o_z() {
+        let frames = [anim_frame(8, 4, 50), anim_frame(8, 4, 50)];
+        let out = render_animation_with(&frames, LoopCount::Infinite, &opts(), 11, true);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.starts_with("\x1b_Ga=T,C=1,U=1,f=32,s=8,v=4,i=11,q=2,o=z,m="),
+            "{s}"
+        );
+        assert!(
+            s.contains("\x1b_Ga=f,f=32,s=8,v=4,i=11,q=2,X=1,o=z,z=50,m=0;"),
+            "{s}"
+        );
     }
 }

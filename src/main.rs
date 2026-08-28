@@ -163,15 +163,15 @@ fn run_preview(
     // emits blocks strictly in input order. Single file (and stdin) keeps
     // the plain serial path below.
     if multi {
-        return preview_parallel(sources, &term, &opts, bounds, &mut out);
+        return preview_parallel(sources, &term, &opts, bounds, args.animate, &mut out);
     }
 
     let mut wrote_before = false;
     for source in sources {
         let path = display_source(source);
-        match input::load(source, &opts, bounds) {
+        match input::load(source, &opts, bounds, args.animate) {
             Ok(loaded) => {
-                let block = render_block(&loaded.img, &term, &opts);
+                let block = render_loaded(&loaded, &term, &opts);
                 emit_preview_item(&mut out, multi, term.protocol, wrote_before, &path, &block)
                     .map_err(|e| AppErr::Fatal(e.to_string()))?;
                 out.flush().map_err(|e| AppErr::Fatal(e.to_string()))?;
@@ -183,6 +183,58 @@ fn run_preview(
     Ok(())
 }
 
+/// Tmux passthrough for graphics escapes. Sixel is downgraded to Half Blocks
+/// at detect() time (nested DCS escaping does not survive tmux), so only
+/// Kitty APC chunks and Iip OSC frames get the passthrough treatment.
+fn wrap_tmux(block: Vec<u8>, term: &detect::TerminalInfo) -> Vec<u8> {
+    if term.tmux && matches!(term.protocol, Protocol::Kitty | Protocol::Iip) {
+        detect::wrap_graphics_passthrough(&block)
+    } else {
+        block
+    }
+}
+
+/// Render a loaded source to a protocol block. A GIF animation renders
+/// animated on Kitty (native animation protocol) and on iTerm2/mintty
+/// (OSC 1337 passes the raw GIF through for the terminal to play); everywhere
+/// else the first frame is shown as a static image. Pure function of
+/// (loaded, term, opts): safe to call from worker threads.
+fn render_loaded(
+    loaded: &input::Loaded,
+    term: &detect::TerminalInfo,
+    opts: &size::RenderOpts,
+) -> Vec<u8> {
+    match loaded {
+        input::Loaded::Static(img) => render_block(img, term, opts),
+        input::Loaded::Gif(anim) => {
+            let animated = match term.protocol {
+                Protocol::Kitty => true,
+                // Only the OSC 1337 brands that actually play GIF payloads
+                // animate; the rest (Warp, VSCode, ...) show the first frame.
+                Protocol::Iip => matches!(
+                    term.brand,
+                    Some(brand::Brand::Iterm2) | Some(brand::Brand::Mintty)
+                ),
+                _ => false,
+            };
+            let block = if animated {
+                match term.protocol {
+                    Protocol::Kitty => kitty::render_animation(
+                        &anim.frames,
+                        anim.loop_count,
+                        opts,
+                        kitty::new_image_id(),
+                    ),
+                    _ => iip::render_gif_raw(&anim.raw, opts, &anim.frames[0].img),
+                }
+            } else {
+                render_block(&anim.frames[0].img, term, opts)
+            };
+            wrap_tmux(block, term)
+        }
+    }
+}
+
 /// Render a loaded image to a protocol frame (plus tmux DCS passthrough
 /// wrapping when needed). Pure function of (img, term, opts): safe to call
 /// from worker threads.
@@ -191,19 +243,13 @@ fn render_block(
     term: &detect::TerminalInfo,
     opts: &size::RenderOpts,
 ) -> Vec<u8> {
-    let mut block = match term.protocol {
+    let block = match term.protocol {
         Protocol::Kitty => kitty::render(img, opts, kitty::new_image_id()),
         Protocol::Iip => iip::render(img, opts),
         Protocol::Sixel => sixel::render(img, opts),
         Protocol::HalfBlocks => halfblock::render(img, opts).into_bytes(),
     };
-    // Sixel is downgraded to Half Blocks at detect() time (nested
-    // DCS escaping does not survive tmux), so only Kitty APC
-    // chunks and Iip OSC frames get the passthrough treatment.
-    if term.tmux && matches!(term.protocol, Protocol::Kitty | Protocol::Iip) {
-        block = detect::wrap_graphics_passthrough(&block);
-    }
-    block
+    wrap_tmux(block, term)
 }
 
 /// Worker count for multi-file previews. Each worker holds at most one
@@ -222,6 +268,7 @@ fn preview_parallel(
     term: &detect::TerminalInfo,
     opts: &size::RenderOpts,
     bounds: (u64, u64),
+    animate: bool,
     out: &mut dyn Write,
 ) -> Result<(), AppErr> {
     use std::collections::BTreeMap;
@@ -245,9 +292,9 @@ fn preview_parallel(
                         break;
                     }
                     let path = display_source(&sources[i]);
-                    let res = input::load(&sources[i], opts, bounds)
+                    let res = input::load(&sources[i], opts, bounds, animate)
                         .map_err(|e| e.to_string())
-                        .map(|loaded| render_block(&loaded.img, term, opts));
+                        .map(|loaded| render_loaded(&loaded, term, opts));
                     if tx.send((i, path, res)).is_err() {
                         break;
                     }
@@ -487,5 +534,102 @@ mod tests {
         let src = input::Source::Path(PathBuf::from("foo//bar.png"));
         assert_eq!(display_source(&src), "foo//bar.png");
         assert_eq!(display_source(&input::Source::Stdin), "-");
+    }
+
+    // ---- GIF animation dispatch ----
+
+    fn opts() -> size::RenderOpts {
+        size::RenderOpts {
+            width: None,
+            quality: size::Quality::default(),
+            cell: detect::CellPx { w: 9, h: 18 },
+            win: detect::WinSize {
+                cols: 80,
+                rows: 24,
+                px: None,
+            },
+            dpy_scale: 1,
+        }
+    }
+
+    fn term_of(
+        protocol: Protocol,
+        brand: Option<brand::Brand>,
+        tmux: bool,
+    ) -> detect::TerminalInfo {
+        detect::TerminalInfo {
+            protocol,
+            cell: detect::CellPx { w: 9, h: 18 },
+            win: detect::WinSize {
+                cols: 80,
+                rows: 24,
+                px: None,
+            },
+            tmux,
+            dpy_scale: 1,
+            probed_scale: None,
+            brand,
+        }
+    }
+
+    fn gif_loaded() -> input::Loaded {
+        input::Loaded::Gif(input::GifAnimation {
+            raw: b"GIF89a-fake-frames".to_vec(),
+            frames: vec![
+                input::AnimFrame {
+                    img: image::DynamicImage::new_rgba8(4, 4),
+                    delay_ms: 50,
+                },
+                input::AnimFrame {
+                    img: image::DynamicImage::new_rgba8(4, 4),
+                    delay_ms: 50,
+                },
+            ],
+            loop_count: image::metadata::LoopCount::Infinite,
+        })
+    }
+
+    /// Whether an Iip block's OSC 1337 payload is a raw GIF ("R0lG" is
+    /// base64 for "GIF8").
+    fn osc_payload_is_gif(block: &[u8]) -> bool {
+        let s = std::str::from_utf8(block).unwrap();
+        let start = s.find(':').unwrap() + 1;
+        let end = s.find('\u{7}').unwrap();
+        s[start..end].starts_with("R0lG")
+    }
+
+    #[test]
+    fn gif_animates_on_kitty_protocol() {
+        let term = term_of(Protocol::Kitty, Some(brand::Brand::Ghostty), false);
+        let block = render_loaded(&gif_loaded(), &term, &opts());
+        let s = String::from_utf8_lossy(&block);
+        assert!(s.contains("\x1b_Ga=f"), "frame transfers: {s}");
+        assert!(s.contains("\x1b_Ga=a,i="), "animation controls: {s}");
+    }
+
+    #[test]
+    fn gif_passes_raw_through_on_iterm2_and_mintty_only() {
+        let o = opts();
+        for brand in [Some(brand::Brand::Iterm2), Some(brand::Brand::Mintty)] {
+            let term = term_of(Protocol::Iip, brand, false);
+            assert!(
+                osc_payload_is_gif(&render_loaded(&gif_loaded(), &term, &o)),
+                "{brand:?} must pass the raw GIF through"
+            );
+        }
+        for brand in [Some(brand::Brand::Warp), Some(brand::Brand::Vscode), None] {
+            let term = term_of(Protocol::Iip, brand, false);
+            assert!(
+                !osc_payload_is_gif(&render_loaded(&gif_loaded(), &term, &o)),
+                "{brand:?} must fall back to the first frame"
+            );
+        }
+    }
+
+    #[test]
+    fn gif_tmux_wraps_animation_escapes() {
+        let term = term_of(Protocol::Kitty, Some(brand::Brand::Ghostty), true);
+        let block = render_loaded(&gif_loaded(), &term, &opts());
+        assert!(block.starts_with(b"\x1bPtmux;"), "{:?}", &block[..32]);
     }
 }
