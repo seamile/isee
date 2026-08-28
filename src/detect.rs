@@ -34,14 +34,21 @@ pub struct TerminalInfo {
     pub cell: CellPx,
     pub win: WinSize,
     pub tmux: bool,
-    /// Device pixels per logical point for the bitmap protocols, from the
-    /// window-pixel report (or `ISEE_DPI_SCALE`). 1 when unknowable.
+    /// Device pixels per logical point requested via `ISEE_DPI_SCALE`
+    /// (1 when unset). Note the units of `win.px` are brand-dependent:
+    /// Warp reports logical points, kitty/Ghostty/iTerm2 report device
+    /// pixels — do not feed `win.px` straight into a bitmap-px bound.
     pub dpy_scale: u32,
+    /// Device pixels per logical point as probed from the terminal itself
+    /// (iTerm2's OSC 1337 ReportCellSize is the only known source).
+    /// Informational for now: rendering still keys off `dpy_scale`.
+    pub probed_scale: Option<f32>,
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const KGP_PROBE: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 const CSI_CELL_PX: &[u8] = b"\x1b[16t";
+const OSC_CELL_SIZE: &[u8] = b"\x1b]1337;ReportCellSize\x1b\\";
 const MAX_RESPONSE: usize = 4096;
 
 pub fn is_tty(fd: i32) -> bool {
@@ -62,6 +69,7 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
 
     let mut cell = fallback_cell();
     let mut probed_kitty = false;
+    let mut probed_scale = None;
 
     if override_p.is_none()
         && stdout_tty
@@ -81,7 +89,20 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
         if env_kitty {
             probed_kitty = probe_kgp(&mut tty, tmux);
         }
-        if let Some(c) = probe_cell_px(&mut tty, tmux) {
+        let iterm2 = brand == Some(crate::brand::Brand::Iterm2);
+        if iterm2 {
+            // iTerm2 never answers `CSI 16 t` (that path would just burn a
+            // full probe timeout), but it replies to the OSC 1337
+            // ReportCellSize query with the cell size in logical points PLUS
+            // the device-pixel scale. Fall back to the generic probe if the
+            // answer does not parse.
+            if let Some((c, s)) = probe_report_cell_size(&mut tty, tmux) {
+                cell = c;
+                probed_scale = Some(s);
+            } else if let Some(c) = probe_cell_px(&mut tty, tmux) {
+                cell = c;
+            }
+        } else if let Some(c) = probe_cell_px(&mut tty, tmux) {
             cell = c;
         }
         drain_input(tty.file.as_raw_fd());
@@ -100,10 +121,14 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
     }
 
     let win = win_size(stdout_fd);
-    // Default 1 = native-px semantics, matching imgcat exactly: iTerm2/Warp
-    // render one declared px as one logical point and auto-fit oversized
-    // images to the window. `ISEE_DPI_SCALE=2` opts into point sizing (the
-    // bitmap is halved so a Retina screenshot shows at QuickLook size).
+    // Default 1 = native-px semantics. How a declared `Npx` size renders is
+    // BRAND-dependent (measured on a 2x Retina display, fullscreen): Warp
+    // draws one declared px as one logical point (QuickLook-like), while
+    // iTerm2 draws it as one DEVICE pixel — so the same bitmap+declaration
+    // shows twice as wide on Warp. Kitty (device px) and Half Blocks (cell
+    // units) always stay at 1. `ISEE_DPI_SCALE=2` shrinks the bitmap to
+    // point size before encoding; that reaches the QuickLook intent on Warp
+    // but halves it again on iTerm2 (there, `-w 2x` means QuickLook size).
     let dpy_scale = isee_dpi_scale().unwrap_or(1);
 
     let info = TerminalInfo {
@@ -112,10 +137,11 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
         win,
         tmux,
         dpy_scale,
+        probed_scale,
     };
     if env::var("ISEE_DEBUG").is_ok() {
         eprintln!(
-            "isee: protocol={:?} cell={}x{} win={}x{} px={:?} scale={} tmux={}",
+            "isee: protocol={:?} cell={}x{} win={}x{} px={:?} scale={} probed_scale={:?} tmux={}",
             info.protocol,
             info.cell.w,
             info.cell.h,
@@ -123,6 +149,7 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
             info.win.rows,
             info.win.px,
             info.dpy_scale,
+            info.probed_scale,
             tmux
         );
     }
@@ -277,6 +304,52 @@ fn probe_cell_px(tty: &mut RawTty, passthrough: bool) -> Option<CellPx> {
         }
     };
     parse_csi_t(&r)
+}
+
+/// iTerm2's OSC 1337 cell-size query. The reply carries the cell in logical
+/// points plus the display scale, which also makes it a scale probe.
+fn probe_report_cell_size(tty: &mut RawTty, passthrough: bool) -> Option<(CellPx, f32)> {
+    if !write_probe(tty, OSC_CELL_SIZE, passthrough) {
+        return None;
+    }
+    let r = match read_until(tty, b"\x1b\\", PROBE_TIMEOUT) {
+        ProbeRead::Found(r) => {
+            dbg_dump("cellsize", &r);
+            r
+        }
+        ProbeRead::Timeout(r) => {
+            dbg_dump("cellsize-timeout", &r);
+            return None;
+        }
+    };
+    parse_report_cell_size(&r)
+}
+
+/// Parse `ESC]1337;ReportCellSize=<height>;<width>;<scale>ESC\` (or a
+/// BEL-terminated variant). Order is HEIGHT first, values are floats;
+/// verified against iTerm2 on a 2x display: `=16.0;7.0;2.0` with the
+/// window report cross-checking 7x16 pt * 2 = 14x32 device px.
+fn parse_report_cell_size(raw: &[u8]) -> Option<(CellPx, f32)> {
+    let s = std::str::from_utf8(raw).ok()?;
+    let idx = s.find("ReportCellSize=")?;
+    // Payload runs to the ST or BEL terminator.
+    let body = s[idx + "ReportCellSize=".len()..]
+        .split(['\x1b', '\x07'])
+        .next()?;
+    let mut parts = body.split(';');
+    let h: f32 = parts.next()?.trim().parse().ok()?;
+    let w: f32 = parts.next()?.trim().parse().ok()?;
+    let scale: f32 = parts.next()?.trim().parse().ok()?;
+    if h <= 0.0 || w <= 0.0 || scale <= 0.0 {
+        return None;
+    }
+    Some((
+        CellPx {
+            w: w.round() as u32,
+            h: h.round() as u32,
+        },
+        scale,
+    ))
 }
 
 fn parse_csi_t(raw: &[u8]) -> Option<CellPx> {
@@ -523,6 +596,35 @@ mod tests {
             Some(CellPx { w: 40, h: 36 })
         );
         assert_eq!(parse_csi_t(b"\x1b[6;0;0t"), None);
+    }
+
+    #[test]
+    fn report_cell_size_st_terminated() {
+        let (cell, scale) =
+            parse_report_cell_size(b"junk\x1b]1337;ReportCellSize=16.0;7.0;2.0\x1b\\").unwrap();
+        assert_eq!(cell, CellPx { w: 7, h: 16 });
+        assert!((scale - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn report_cell_size_bel_terminated() {
+        let (cell, scale) =
+            parse_report_cell_size(b"\x1b]1337;ReportCellSize=11.5;8.5;1.0\x07").unwrap();
+        assert_eq!(cell, CellPx { w: 9, h: 12 });
+        assert!((scale - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn report_cell_size_rejects_bad_payload() {
+        assert_eq!(
+            parse_report_cell_size(b"\x1b]1337;ReportCellSize=0;0;0\x1b\\"),
+            None
+        );
+        assert_eq!(
+            parse_report_cell_size(b"\x1b]1337;ReportCellSize=16.0;7.0\x1b\\"),
+            None
+        );
+        assert_eq!(parse_report_cell_size(b"no answer here"), None);
     }
 
     #[test]
