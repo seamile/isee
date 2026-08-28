@@ -235,20 +235,22 @@ fn preview_parallel(
 
     std::thread::scope(|scope| -> Result<(), AppErr> {
         for _ in 0..workers {
-            scope.spawn(|| loop {
-                if stop.load(Ordering::Relaxed) != 0 {
-                    break;
-                }
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= sources.len() {
-                    break;
-                }
-                let path = display_source(&sources[i]);
-                let res = input::load(&sources[i], opts, bounds)
-                    .map_err(|e| e.to_string())
-                    .map(|loaded| render_block(&loaded.img, term, opts));
-                if tx.send((i, path, res)).is_err() {
-                    break;
+            scope.spawn(|| {
+                loop {
+                    if stop.load(Ordering::Relaxed) != 0 {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= sources.len() {
+                        break;
+                    }
+                    let path = display_source(&sources[i]);
+                    let res = input::load(&sources[i], opts, bounds)
+                        .map_err(|e| e.to_string())
+                        .map(|loaded| render_block(&loaded.img, term, opts));
+                    if tx.send((i, path, res)).is_err() {
+                        break;
+                    }
                 }
             });
         }
