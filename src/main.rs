@@ -230,7 +230,7 @@ fn preview_parallel(
 
     let next = AtomicUsize::new(0);
     let stop = AtomicUsize::new(0);
-    let workers = sources.len().min(PREVIEW_WORKERS).max(1);
+    let workers = sources.len().clamp(1, PREVIEW_WORKERS);
     let (tx, rx) = mpsc::channel::<(usize, String, Result<Vec<u8>, String>)>();
 
     std::thread::scope(|scope| -> Result<(), AppErr> {

@@ -36,3 +36,4 @@ strip = true
 
 [profile.dev]
 debug = 1
+codegen-units = 256
