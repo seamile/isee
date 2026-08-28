@@ -4,11 +4,12 @@ use crate::detect::{CellPx, WinSize};
 
 /// Scaling bounds for bitmap protocols drawn by the terminal itself
 /// (Iip/Sixel), in LOGICAL pixels: the probed/logical cell times the grid.
-/// OSC 1337's `width/height=Npx` and Sixel bitmaps are rendered by iTerm2,
-/// Warp & co at one image pixel per logical point (unlike KGP, which maps an
-/// image pixel to a device pixel on HiDPI screens), so feeding device-pixel
-/// sizes here doubles the visible height on Retina. yazi uses the same
-/// logical-cell convention for both drivers.
+/// How a declared `Npx` size actually renders is brand-dependent (measured
+/// on a 2x Retina display): Warp & co draw one image pixel per logical
+/// point, but iTerm2 draws one image pixel per DEVICE pixel — these bounds
+/// follow yazi's logical-cell convention for both drivers, so they are
+/// exact on Warp and conservative (2x) on iTerm2, whose auto-fit still
+/// clamps the result. KGP instead maps an image pixel to a device pixel.
 pub fn bitmap_bounds(o: &RenderOpts) -> (u64, u64) {
     (
         (o.win.cols as u64 * o.cell.w.max(1) as u64).max(1),
@@ -60,11 +61,12 @@ pub struct RenderOpts {
     pub quality: Quality,
     pub cell: CellPx,
     pub win: WinSize,
-    /// Device pixels per logical point for the bitmap protocols (Iip/Sixel).
-    /// Their sizes are declared in logical points, so on a Retina screen an
-    /// undeclared-size image would show twice as large unless the bitmap
-    /// itself shrinks to point size first. Kitty (device pixels) and Half
-    /// Blocks (cell units) always use 1.
+    /// Device pixels per logical point for the bitmap protocols (Iip/Sixel),
+    /// from `ISEE_DPI_SCALE` only (1 when unset). When set, the bitmap is
+    /// shrunk to point size first (`input::shrink_to_points`), which assumes
+    /// the terminal renders one declared px as one logical point — true on
+    /// Warp, FALSE on iTerm2 (device pixels there), and unused by Kitty
+    /// (device pixels) and Half Blocks (cell units).
     pub dpy_scale: u32,
 }
 
