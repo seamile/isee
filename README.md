@@ -38,8 +38,8 @@ If `IMGPATH` is omitted, image data is read from `stdin`.
 - `-q QUALITY`: Preview scaling quality: `L` (nearest, fastest), `M`
   (triangle, default), `H` (lanczos, sharpest)
 - `-i`: Show image information (size, dimensions, DPI, colorspace, alpha)
-- `-a`: Animate GIFs where the terminal supports it (kitty; iTerm2, mintty),
-  else fall back to the first frame
+- `-a`: Animate GIFs and animated WebPs where the terminal supports it
+  (kitty; iTerm2/mintty for GIFs), else fall back to the first frame
 - `-v`: Print the version
 - `-h, --help`: Print help
 
@@ -77,8 +77,9 @@ isee -q H /foo/bar/image.jpg
 # Show image information
 isee -i /foo/bar/image.jpg
 
-# Animate a GIF (first frame only where the terminal can't animate)
+# Animate a GIF or animated WebP (first frame only where the terminal can't)
 isee -a /foo/bar/animation.gif
+isee -a /foo/bar/animation.webp
 
 # Read image data from a pipe
 cat /foo/bar/image.jpg | isee
@@ -145,14 +146,16 @@ cat /foo/bar/image.jpg | isee
   DCS escaping is unreliable, so Sixel degrades to Half Blocks there; force it
   with `ISEE_PROTOCOL=sixel` if you know your setup works.
 
-- **GIF animation (`-a`)** — Animated GIFs play on terminals that support
-  animation: kitty via the native graphics animation protocol (composited
-  full-canvas frames transferred as `a=f` chunks), and iTerm2/mintty via OSC
-  1337 passing the raw GIF through unmodified for the terminal to play.
-  Everywhere else (Warp, VSCode, Ghostty ≤1.3.1, ...) the first frame is
-  shown as a static image, matching `imgcat` behavior. Animation decoding is
-  budgeted (192 MiB of target RGBA, 4096 frames) and truncates rather than
-  failing.
+- **Animation (`-a`)** — Animated GIFs and animated WebPs play on kitty via
+  the native graphics animation protocol (composited full-canvas frames
+  transferred as `a=f` chunks); GIF/WebP frames are decoded by the pure-Rust
+  `image`/`image-webp` crates. iTerm2/mintty animate GIFs via OSC 1337
+  passing the raw file through unmodified for the terminal to play — no
+  OSC 1337 terminal renders an animated WebP, so those show the first frame
+  there. Everywhere else (Warp, VSCode, Ghostty ≤1.3.1, ...) the first frame
+  is shown as a static image, matching `imgcat` behavior. Animation decoding
+  is budgeted (192 MiB of target RGBA, 4096 frames) and truncates rather
+  than failing.
 
 - **Half Blocks fallback** — Terminals without graphics support get a downscaled,
   color-reduced character-pair rendering. `ISEE_PROTOCOL=half|kitty|iip|sixel`
