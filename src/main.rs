@@ -150,6 +150,10 @@ fn run_preview(
             Protocol::Iip | Protocol::Sixel => term.dpy_scale,
             Protocol::Kitty | Protocol::HalfBlocks => 1,
         },
+        // Kitty renders through the placeholder grid inside tmux (the pane's
+        // cursor model cannot track the outer terminal's placement moves).
+        tmux: term.tmux,
+        transfer: term.kgp_transfer,
     };
     let bounds = match term.protocol {
         Protocol::Kitty => size::kitty_bounds(&opts),
@@ -596,6 +600,8 @@ mod tests {
                 px: None,
             },
             dpy_scale: 1,
+            tmux: false,
+            transfer: size::KgpTransfer::Stream,
         }
     }
 
@@ -616,6 +622,7 @@ mod tests {
             dpy_scale: 1,
             probed_scale: None,
             brand,
+            kgp_transfer: size::KgpTransfer::Stream,
         }
     }
 
@@ -676,7 +683,9 @@ mod tests {
     #[test]
     fn gif_tmux_wraps_animation_escapes() {
         let term = term_of(Protocol::Kitty, Some(brand::Brand::Ghostty), true);
-        let block = render_loaded(&gif_loaded(), &term, &opts());
+        let mut o = opts();
+        o.tmux = true;
+        let block = render_loaded(&gif_loaded(), &term, &o);
         assert!(block.starts_with(b"\x1bPtmux;"), "{:?}", &block[..32]);
     }
 }

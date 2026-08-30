@@ -45,23 +45,31 @@ fn kitty_terminal_bounds(o: &RenderOpts) -> (u64, u64) {
 }
 
 /// Scaling bounds for the Kitty protocol, in DEVICE pixels: the terminal
-/// grid, clamped to `kitty::MAX_PLACEHOLDER_CELLS` per axis. A placeholder's
-/// row/column offset is one diacritic from a 297-entry table, so offsets past
-/// 296 cannot be expressed — a wider grid used to fall back to diacritic 0
-/// and garble everything right of row/column 296 (visible from `-w` ~2970 on
-/// a 10 px-cell terminal, and the same for heights past 297 cell rows).
-/// Images beyond the cap shrink to fit.
+/// grid. Direct placement (`a=T` without `C=1`) renders the bitmap at its
+/// declared device-pixel size and auto-fits oversize images, so the only
+/// bound is what the window can show. Inside tmux, though, rendering goes
+/// through the placeholder grid (tmux's cursor model cannot track the outer
+/// terminal's placement moves), and a placeholder cell's row/column offset is
+/// one diacritic from a 297-entry table — offsets past 296 cannot be
+/// expressed and fall back to diacritic 0, garbling everything right of
+/// row/column 296 (visible from `-w` ~2970 on a 10 px-cell terminal). So the
+/// tmux path clamps to the addressable grid; images beyond it shrink to fit.
 pub fn kitty_bounds(o: &RenderOpts) -> (u64, u64) {
-    let cap = kitty_grid_cap_px(o);
     let (w, h) = kitty_terminal_bounds(o);
-    (w.min(cap.0), h.min(cap.1))
+    if o.tmux {
+        let cap = kitty_grid_cap_px(o);
+        (w.min(cap.0), h.min(cap.1))
+    } else {
+        (w, h)
+    }
 }
 
-/// One-line stderr notice for the kitty placeholder limit: `Some` when this
-/// image's preview had to shrink below what the terminal grid alone would
-/// allow — i.e. the 297-entry diacritics table, not the window, is the
-/// binding constraint. `img` is the RAW image size (for animations the GIF
-/// canvas, not the resized preview frames).
+/// One-line stderr notice for the kitty placeholder limit (tmux only): `Some`
+/// when this image's preview had to shrink below what the terminal grid alone
+/// would allow — i.e. the 297-entry diacritics table, not the window, is the
+/// binding constraint. Direct placement (non-tmux) has no such cap, so this
+/// is naturally `None` there. `img` is the RAW image size (for animations the
+/// GIF canvas, not the resized preview frames).
 pub fn kitty_protocol_clamp_notice(img: (u32, u32), o: &RenderOpts) -> Option<String> {
     let uncapped = target_dims(img.0, img.1, o, kitty_terminal_bounds(o));
     let capped = target_dims(img.0, img.1, o, kitty_bounds(o));
@@ -69,7 +77,7 @@ pub fn kitty_protocol_clamp_notice(img: (u32, u32), o: &RenderOpts) -> Option<St
         return None;
     }
     Some(format!(
-        "isee: limited to {}x{} px by the Kitty Graphics Protocol",
+        "isee: limited to {}x{} px by kitty's placeholder cell table (tmux)",
         capped.0, capped.1,
     ))
 }
@@ -97,6 +105,17 @@ pub fn halfblock_bounds(o: &RenderOpts) -> (u64, u64) {
     )
 }
 
+/// How KGP payloads reach the terminal: streamed through the pty in
+/// escape-sequence chunks (`Stream`), or handed over as a temp file whose
+/// path alone crosses the pty (`Tempfile`). Tempfile is only usable when a
+/// probe confirmed the terminal accepts `t=1` transfers (kitty deletes the
+/// file after reading); anything else falls back to `Stream`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KgpTransfer {
+    Stream,
+    Tempfile,
+}
+
 pub struct RenderOpts {
     pub width: Option<u32>,
     pub quality: Quality,
@@ -109,6 +128,13 @@ pub struct RenderOpts {
     /// Warp, FALSE on iTerm2 (device pixels there), and unused by Kitty
     /// (device pixels) and Half Blocks (cell units).
     pub dpy_scale: u32,
+    /// True inside tmux: kitty renders through the placeholder grid (tmux's
+    /// cursor model cannot track the outer terminal's placement moves), so
+    /// the 297-cell diacritics clamp still applies.
+    pub tmux: bool,
+    /// KGP payload transport chosen at detect() time (probe result or
+    /// `ISEE_KGP_TRANSFER` override).
+    pub transfer: KgpTransfer,
 }
 
 /// Preview quality tier mapped to a resize filter:
@@ -201,6 +227,8 @@ mod tests {
                 px: None,
             },
             dpy_scale: 1,
+            tmux: false,
+            transfer: KgpTransfer::Stream,
         }
     }
 
@@ -310,6 +338,7 @@ mod tests {
         // 4000 px; the bounds must cap it at 2970 so `-w 3500` shrinks to
         // fit instead of garbling everything right of column 296.
         let mut o = opts();
+        o.tmux = true;
         o.cell = CellPx { w: 10, h: 20 };
         o.win = WinSize {
             cols: 400,
@@ -317,6 +346,22 @@ mod tests {
             px: None,
         };
         assert_eq!(kitty_bounds(&o), (2970, 5940));
+    }
+
+    #[test]
+    fn direct_placement_bounds_have_no_protocol_cap() {
+        // Outside tmux the image is placed directly at its declared size and
+        // the terminal auto-fits oversize bitmaps, so a 400-col window stays
+        // 4000 px wide — no 297-cell clamp applies.
+        let mut o = opts();
+        o.tmux = false;
+        o.cell = CellPx { w: 10, h: 20 };
+        o.win = WinSize {
+            cols: 400,
+            rows: 400,
+            px: None,
+        };
+        assert_eq!(kitty_bounds(&o), (4000, 8000));
     }
 
     #[test]
@@ -333,9 +378,10 @@ mod tests {
 
     #[test]
     fn clamp_notice_fires_for_wide_request() {
-        // -w 3500 on a 10 px-cell terminal: the protocol (2970 px), not the
-        // 400-col window (4000 px), is what shrinks the image.
+        // -w 3500 on a 10 px-cell terminal (tmux): the protocol (2970 px),
+        // not the 400-col window (4000 px), is what shrinks the image.
         let mut o = opts();
+        o.tmux = true;
         o.cell = CellPx { w: 10, h: 20 };
         o.win = WinSize {
             cols: 400,
@@ -345,7 +391,23 @@ mod tests {
         o.width = Some(3500);
         let msg = kitty_protocol_clamp_notice((3000, 100), &o).unwrap();
         assert!(msg.contains("2970x98"), "{msg}");
-        assert!(msg.contains("Kitty Graphics Protocol"), "{msg}");
+        assert!(msg.contains("placeholder cell table"), "{msg}");
+    }
+
+    #[test]
+    fn clamp_notice_silent_for_direct_placement() {
+        // Non-tmux direct placement has no protocol cap: the same wide
+        // request fits the window and no notice fires.
+        let mut o = opts();
+        o.tmux = false;
+        o.cell = CellPx { w: 10, h: 20 };
+        o.win = WinSize {
+            cols: 400,
+            rows: 400,
+            px: None,
+        };
+        o.width = Some(3500);
+        assert_eq!(kitty_protocol_clamp_notice((3000, 100), &o), None);
     }
 
     #[test]
@@ -353,6 +415,7 @@ mod tests {
         // A portrait image without -w: the 297-row cap (5940 px) binds
         // before the 400-row window (8000 px).
         let mut o = opts();
+        o.tmux = true;
         o.cell = CellPx { w: 10, h: 20 };
         o.win = WinSize {
             cols: 400,
@@ -361,7 +424,7 @@ mod tests {
         };
         let msg = kitty_protocol_clamp_notice((1500, 6000), &o).unwrap();
         assert!(msg.contains("1485x5940"), "{msg}");
-        assert!(msg.contains("Kitty Graphics Protocol"), "{msg}");
+        assert!(msg.contains("placeholder cell table"), "{msg}");
     }
 
     #[test]
@@ -369,6 +432,7 @@ mod tests {
         // A 200-col window (2000 px) is narrower than the 2970 px protocol
         // cap: the same bounds apply either way, so no protocol notice.
         let mut o = opts();
+        o.tmux = true;
         o.cell = CellPx { w: 10, h: 20 };
         o.win = WinSize {
             cols: 200,

@@ -4,6 +4,8 @@ use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 
+use crate::size::KgpTransfer;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
     Kitty,
@@ -46,6 +48,9 @@ pub struct TerminalInfo {
     /// Env-recognized terminal brand (see `brand::detect`); gates
     /// brand-specific behavior such as the Iip GIF-animation whitelist.
     pub brand: Option<crate::brand::Brand>,
+    /// How kitty-protocol payloads should reach the terminal: probed
+    /// tempfile support (`t=1`), or the `ISEE_KGP_TRANSFER` override.
+    pub kgp_transfer: KgpTransfer,
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -72,6 +77,7 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
 
     let mut cell = fallback_cell();
     let mut probed_kitty = false;
+    let mut probed_file = false;
     let mut probed_scale = None;
 
     if override_p.is_none()
@@ -90,7 +96,7 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
             enable_tmux_passthrough();
         }
         if env_kitty {
-            probed_kitty = probe_kgp(&mut tty, tmux);
+            (probed_kitty, probed_file) = probe_kgp(&mut tty, tmux);
         }
         let iterm2 = brand == Some(crate::brand::Brand::Iterm2);
         if iterm2 {
@@ -133,6 +139,10 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
     // point size before encoding; that reaches the QuickLook intent on Warp
     // but halves it again on iTerm2 (there, `-w 2x` means QuickLook size).
     let dpy_scale = isee_dpi_scale().unwrap_or(1);
+    let kgp_transfer = kgp_transfer_choice(
+        probed_kitty && probed_file,
+        env::var("ISEE_KGP_TRANSFER").ok().as_deref(),
+    );
 
     let info = TerminalInfo {
         protocol,
@@ -142,10 +152,11 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
         dpy_scale,
         probed_scale,
         brand,
+        kgp_transfer,
     };
     if env::var("ISEE_DEBUG").is_ok() {
         eprintln!(
-            "isee: protocol={:?} cell={}x{} win={}x{} px={:?} scale={} probed_scale={:?} tmux={}",
+            "isee: protocol={:?} cell={}x{} win={}x{} px={:?} scale={} probed_scale={:?} tmux={} transfer={:?}",
             info.protocol,
             info.cell.w,
             info.cell.h,
@@ -154,7 +165,8 @@ pub fn detect(stdout_fd: i32) -> TerminalInfo {
             info.win.px,
             info.dpy_scale,
             info.probed_scale,
-            tmux
+            tmux,
+            info.kgp_transfer
         );
     }
     info
@@ -267,30 +279,122 @@ fn enable_tmux_passthrough() {
     quiet(Command::new("tmux").args(["set", "-s", "input-buffer-size", "104857600"]));
 }
 
+/// Resolve the KGP payload transport: `ISEE_KGP_TRANSFER` forces a mode
+/// (`tempfile`/`file`, or `stream`), otherwise the tempfile mode rides on the
+/// probe result (the terminal answered OK to a `t=1` query); anything else
+/// streams the payload through the pty.
+fn kgp_transfer_choice(probed_tempfile: bool, forced: Option<&str>) -> KgpTransfer {
+    let forced = forced.map(|v| v.trim().to_ascii_lowercase());
+    match forced.as_deref() {
+        Some("tempfile") | Some("file") => KgpTransfer::Tempfile,
+        Some("stream") => KgpTransfer::Stream,
+        _ if probed_tempfile => KgpTransfer::Tempfile,
+        _ => KgpTransfer::Stream,
+    }
+}
+
 fn write_probe(tty: &mut RawTty, seq: &[u8], passthrough: bool) -> bool {
-    let out = if passthrough {
+    tty.file.write_all(&probe_bytes(seq, passthrough)).is_ok()
+}
+
+fn probe_bytes(seq: &[u8], passthrough: bool) -> Vec<u8> {
+    if passthrough {
         wrap_passthrough(seq)
     } else {
         seq.to_vec()
-    };
-    tty.file.write_all(&out).is_ok()
+    }
 }
 
-fn probe_kgp(tty: &mut RawTty, passthrough: bool) -> bool {
-    if !write_probe(tty, KGP_PROBE, passthrough) {
-        return false;
+/// Probe KGP support with two queries in one shot: `t=d` (streaming
+/// transfer) and `t=t` (tempfile transfer). Only terminals that speak KGP
+/// answer the first; the second carries a REAL temp file path — kitty
+/// validates `t=t` queries by opening the payload as a file, so an arbitrary
+/// payload answers EBADF even on a tempfile-capable kitty (observed live:
+/// `EBADF: Failed to open file for graphics transmission`). The probe file's
+/// name carries kitty's `tty-graphics-protocol` marker so kitty deletes it
+/// after reading; we also unlink it ourselves in case that cleanup does not
+/// run. Both responses share one deadline, and leftover bytes from an early
+/// combined read stay in `tty.pending` for the next `read_until`.
+/// Returns `(streaming_ok, tempfile_ok)`.
+fn probe_kgp(tty: &mut RawTty, passthrough: bool) -> (bool, bool) {
+    let probe_file = std::env::temp_dir().join(format!(
+        "kitty-tty-graphics-protocol-isee-probe-{}",
+        std::process::id()
+    ));
+    let have_file = std::fs::write(&probe_file, [0u8, 0, 0]).is_ok();
+    let mut both = probe_bytes(KGP_PROBE, passthrough);
+    if have_file {
+        let q = format!(
+            "\x1b_Gi=32,s=1,v=1,a=q,t=t,f=24;{}\x1b\\",
+            base64_encode_path(&probe_file)
+        );
+        both.extend_from_slice(&probe_bytes(q.as_bytes(), passthrough));
     }
-    match read_until(tty, b"\x1b\\", PROBE_TIMEOUT) {
-        ProbeRead::Found(r) => {
-            dbg_dump("kgp", &r);
-            let s = String::from_utf8_lossy(&r);
-            s.contains("OK") && s.contains("i=31")
+    if tty.file.write_all(&both).is_err() {
+        if have_file {
+            let _ = std::fs::remove_file(&probe_file);
         }
-        ProbeRead::Timeout(r) => {
-            dbg_dump("kgp-timeout", &r);
-            false
+        return (false, false);
+    }
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut chunks: Vec<String> = Vec::new();
+    let need = if have_file { 2 } else { 1 };
+    while kgp_resolved_ids(&chunks, have_file) < need {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match read_until(tty, b"\x1b\\", deadline - now) {
+            ProbeRead::Found(r) => {
+                dbg_dump("kgp", &r);
+                chunks.push(String::from_utf8_lossy(&r).into_owned());
+            }
+            ProbeRead::Timeout(r) => {
+                dbg_dump("kgp-timeout", &r);
+                break;
+            }
         }
     }
+    if have_file {
+        let _ = std::fs::remove_file(&probe_file);
+    }
+    let (direct, file) = kgp_probe_verdicts(&chunks);
+    (direct, file && have_file)
+}
+
+/// How many of the wanted probe ids (i=31 streaming, i=32 tempfile) have
+/// been resolved by `chunks`? Unrecognized chunks are ignored and the read
+/// loop keeps going until the shared deadline.
+fn kgp_resolved_ids(chunks: &[String], want_file: bool) -> usize {
+    let mut n = usize::from(chunks.iter().any(|s| s.contains("i=31")));
+    if want_file && chunks.iter().any(|s| s.contains("i=32")) {
+        n += 1;
+    }
+    n
+}
+
+fn base64_encode_path(path: &std::path::Path) -> String {
+    crate::b64::base64_encode(path.to_string_lossy().as_bytes())
+}
+
+/// Classify the collected probe responses into `(streaming_ok, tempfile_ok)`.
+/// Kitty echoes the request id on both OK and ERR responses, so one
+/// contains() check per id resolves either outcome.
+fn kgp_probe_verdicts(chunks: &[String]) -> (bool, bool) {
+    chunks.iter().fold((false, false), |(d, f), s| {
+        (
+            if s.contains("i=31") {
+                s.contains("OK")
+            } else {
+                d
+            },
+            if s.contains("i=32") {
+                s.contains("OK")
+            } else {
+                f
+            },
+        )
+    })
 }
 
 fn probe_cell_px(tty: &mut RawTty, passthrough: bool) -> Option<CellPx> {
@@ -629,6 +733,94 @@ mod tests {
             None
         );
         assert_eq!(parse_report_cell_size(b"no answer here"), None);
+    }
+
+    // ---- KGP dual probe (streaming + tempfile) ----
+
+    fn kgp_resp(id: u32, body: &str) -> String {
+        format!("\x1b_Gi={id};{body}\x1b\\")
+    }
+
+    #[test]
+    fn kgp_verdicts_both_ok() {
+        let chunks = [kgp_resp(31, "OK"), kgp_resp(32, "OK")];
+        assert_eq!(kgp_probe_verdicts(&chunks), (true, true));
+        assert_eq!(kgp_resolved_ids(&chunks, true), 2);
+    }
+
+    #[test]
+    fn kgp_verdicts_tempfile_rejected() {
+        let chunks = [
+            kgp_resp(31, "OK"),
+            kgp_resp(32, "EBADF: Failed to open file for graphics transmission"),
+        ];
+        assert_eq!(kgp_probe_verdicts(&chunks), (true, false));
+        assert_eq!(kgp_resolved_ids(&chunks, true), 2);
+    }
+
+    #[test]
+    fn kgp_verdicts_streaming_only() {
+        let chunks = [kgp_resp(31, "OK")];
+        assert_eq!(kgp_probe_verdicts(&chunks), (true, false));
+        assert_eq!(kgp_resolved_ids(&chunks, true), 1);
+        assert_eq!(kgp_resolved_ids(&chunks, false), 1);
+    }
+
+    #[test]
+    fn kgp_verdicts_ignore_unrelated_chunks() {
+        // A stray response for another id (or noise) must not resolve
+        // anything nor corrupt the verdicts that follow.
+        let chunks = [
+            kgp_resp(99, "OK"),
+            kgp_resp(31, "OK"),
+            "noise".to_string(),
+            kgp_resp(32, "OK"),
+        ];
+        assert_eq!(kgp_probe_verdicts(&chunks), (true, true));
+        assert_eq!(kgp_resolved_ids(&chunks, true), 2);
+        assert_eq!(kgp_resolved_ids(&[kgp_resp(99, "OK")], true), 0);
+    }
+
+    #[test]
+    fn kgp_verdicts_single_combined_chunk() {
+        // Both responses can land in one read; the chunk carries both ids.
+        let chunk = format!("{}{}", kgp_resp(31, "OK"), kgp_resp(32, "OK"));
+        let chunks = [chunk];
+        assert_eq!(kgp_probe_verdicts(&chunks), (true, true));
+        assert_eq!(kgp_resolved_ids(&chunks, true), 2);
+    }
+
+    #[test]
+    fn kgp_transfer_choice_prefers_probe_by_default() {
+        assert_eq!(kgp_transfer_choice(true, None), KgpTransfer::Tempfile);
+        assert_eq!(kgp_transfer_choice(false, None), KgpTransfer::Stream);
+    }
+
+    #[test]
+    fn kgp_transfer_choice_env_overrides_probe() {
+        assert_eq!(
+            kgp_transfer_choice(false, Some("tempfile")),
+            KgpTransfer::Tempfile
+        );
+        assert_eq!(
+            kgp_transfer_choice(false, Some("FILE")),
+            KgpTransfer::Tempfile
+        );
+        assert_eq!(
+            kgp_transfer_choice(true, Some("stream")),
+            KgpTransfer::Stream
+        );
+        // Unknown values fall through to the probe result.
+        assert_eq!(
+            kgp_transfer_choice(true, Some("???")),
+            KgpTransfer::Tempfile
+        );
+        assert_eq!(kgp_transfer_choice(false, Some("???")), KgpTransfer::Stream);
+        // Whitespace around the value is trimmed.
+        assert_eq!(
+            kgp_transfer_choice(false, Some(" tempfile ")),
+            KgpTransfer::Tempfile
+        );
     }
 
     #[test]

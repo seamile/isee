@@ -692,6 +692,8 @@ mod tests {
                 px: None,
             },
             dpy_scale: 1,
+            tmux: false,
+            transfer: crate::size::KgpTransfer::Stream,
         }
     }
 

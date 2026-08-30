@@ -8,7 +8,7 @@ use image::metadata::LoopCount;
 
 use crate::b64::base64_encode;
 use crate::input::AnimFrame;
-use crate::size::{self, RenderOpts};
+use crate::size::{self, KgpTransfer, RenderOpts};
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 
@@ -18,7 +18,9 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 /// terminal spends consuming frames — on Ghostty, compression cut a
 /// 103-image batch from ~31 s to ~18 s for ~3 s extra CPU. `o=z` asks the
 /// terminal to zlib-decompress the payload after transfer; the format stays
-/// `f=32`, so `s`/`v` and the placeholder grid are untouched.
+/// `f=32`, so `s`/`v` and the placeholder grid are untouched. Stream
+/// transport only — tempfile transfers cross the pty as a path, with
+/// nothing to compress.
 fn kgp_compress_enabled(v: Option<&str>) -> bool {
     !matches!(
         v,
@@ -51,26 +53,61 @@ fn render_with(img: &DynamicImage, o: &RenderOpts, id: u32, compress: bool) -> V
     } else {
         img.resize(tw, th, size::filter(o.quality)).into_rgba8()
     };
-    let (w, h) = rgba.dimensions();
-    // Grid of cells that will hold the placeholder; only anchors placement,
-    // it does NOT re-scale the image (no c= / r= in the control sequence).
-    // The cell here is the DEVICE-pixel cell so the grid matches the image's
-    // physical size on HiDPI screens (logical cells would double the grid).
-    let (cw, ch) = size::kitty_cell(o);
-    let cols = (w as f64 / cw as f64).ceil().max(1.0) as u32;
-    let rows = (h as f64 / ch as f64).ceil().max(1.0) as u32;
-
-    let mut out = encode(&rgba, w, h, id, compress);
-    place(&mut out, cols, rows, id);
-    out
+    if o.tmux {
+        // Inside tmux the outer terminal's placement moves are invisible to
+        // the pane's cursor model (a following prompt would be painted on
+        // top of the image), so anchor the bitmap to a placeholder grid
+        // instead; icat does the same (it force-enables placeholders in
+        // tmux). Byte-for-byte the pre-direct-placement output.
+        let (w, h) = rgba.dimensions();
+        // Grid of cells that will hold the placeholder; only anchors
+        // placement, it does NOT re-scale the image (no c= / r= in the
+        // control sequence). The cell here is the DEVICE-pixel cell so the
+        // grid matches the image's physical size on HiDPI screens (logical
+        // cells would double the grid).
+        let (cw, ch) = size::kitty_cell(o);
+        let cols = (w as f64 / cw as f64).ceil().max(1.0) as u32;
+        let rows = (h as f64 / ch as f64).ceil().max(1.0) as u32;
+        let mut out = encode(&rgba, w, h, id, compress);
+        place(&mut out, cols, rows, id);
+        out
+    } else {
+        // Direct placement, icat-style: transmit with `a=T` and let the
+        // terminal draw the bitmap at its declared device-pixel size (auto-
+        // fitting oversize images). A leading CR guards against a mid-line
+        // cursor, and a trailing CR LF parks the cursor at column 0 of the
+        // line BELOW the image — after a C=0 placement kitty leaves the
+        // cursor on the image's last row just right of the bitmap
+        // (`cursor.x += num_cols; cursor.y += num_rows - 1`, verified in
+        // kitty's graphics.c and with a live `get-text --add-cursor` probe),
+        // so without the CRLF the next output would overwrite the image's
+        // bottom line.
+        let mut out = Vec::with_capacity(rgba.as_raw().len() / 3 * 4 + 128);
+        out.push(b'\r');
+        let (w, h) = rgba.dimensions();
+        emit_frame(
+            &mut out,
+            &format!("a=T,s={w},v={h},i={id},q=2"),
+            "",
+            &rgba,
+            id,
+            o,
+            compress,
+        );
+        out.extend_from_slice(b"\r\n");
+        out
+    }
 }
 
-/// Render an animated GIF for kitty: the first composited frame is
-/// transmitted as the animation's root image (`a=T`) and anchored with the
-/// regular placeholder grid, every remaining frame follows as an `a=f`
-/// full-canvas frame carrying its own gap, and the animation is started with
-/// `a=a`. The root frame's gap defaults to zero, so it is set explicitly
-/// (`r=1`, the root is frame 1) before the start control.
+/// Render an animated GIF for kitty. Outside tmux: the first composited
+/// frame is transmitted as the animation's root image (`a=T`, direct
+/// placement), every remaining frame follows as an `a=f` full-canvas frame,
+/// playback is armed with `a=a` controls mirroring icat (gap for the root,
+/// `s=2` loading mode once the first extra frame has arrived, `s=3` start
+/// after the last). Inside tmux the root is anchored with the placeholder
+/// grid and the sequence stays byte-for-byte the pre-direct-placement one.
+/// The root frame's gap defaults to zero, so it is set explicitly (`r=1`,
+/// the root is frame 1) before the start control.
 pub fn render_animation(
     frames: &[AnimFrame],
     loop_count: LoopCount,
@@ -92,43 +129,86 @@ fn render_animation_with(
     // so target_px on the first frame is idempotent: no per-frame resize.
     let first = frames[0].img.to_rgba8();
     let (w, h) = first.dimensions();
-    // Grid of cells that will hold the placeholder (device-pixel cell, see
-    // `render_with`); only anchors placement, it does NOT re-scale frames.
-    let (cw, ch) = size::kitty_cell(o);
-    let cols = (w as f64 / cw as f64).ceil().max(1.0) as u32;
-    let rows = (h as f64 / ch as f64).ceil().max(1.0) as u32;
-
-    let mut out = encode(&first, w, h, id, compress);
-    place(&mut out, cols, rows, id);
-    write!(
-        out,
-        "\x1b_Ga=a,i={id},q=2,r=1,z={}\x1b\\",
-        frames[0].delay_ms
-    )
-    .unwrap();
     // s=3 runs the animation normally; v=1 loops infinitely and v=N plays
     // N-1 times, so a GIF asking for n loops maps to n+1.
     let v = match loop_count {
         LoopCount::Infinite => 1,
         LoopCount::Finite(n) => n.get().saturating_add(1),
     };
-    write!(out, "\x1b_Ga=a,i={id},q=2,s=3,v={v}\x1b\\").unwrap();
+    if o.tmux {
+        let (cw, ch) = size::kitty_cell(o);
+        let cols = (w as f64 / cw as f64).ceil().max(1.0) as u32;
+        let rows = (h as f64 / ch as f64).ceil().max(1.0) as u32;
+        let mut out = encode(&first, w, h, id, compress);
+        place(&mut out, cols, rows, id);
+        write!(
+            out,
+            "\x1b_Ga=a,i={id},q=2,r=1,z={}\x1b\\",
+            frames[0].delay_ms
+        )
+        .unwrap();
+        write!(out, "\x1b_Ga=a,i={id},q=2,s=3,v={v}\x1b\\").unwrap();
+        // The canvas of every frame is fully composited (GIF frames arrive
+        // as complete pictures), so `X=1` (simple overwrite) reproduces it
+        // exactly; the default alpha blend would double-blend semi-
+        // transparent pixels.
+        let opts = if compress { ",o=z" } else { "" };
+        for frame in &frames[1..] {
+            let b64 = z64(&frame.img.to_rgba8(), compress);
+            write_chunked(
+                &mut out,
+                &b64,
+                &format!(
+                    "a=f,f=32,s={w},v={h},i={id},q=2,X=1{opts},z={}",
+                    frame.delay_ms
+                ),
+                "a=f",
+            );
+        }
+        return out;
+    }
+    let mut out = Vec::new();
+    out.push(b'\r');
+    emit_frame(
+        &mut out,
+        &format!("a=T,s={w},v={h},i={id},q=2"),
+        "",
+        &first,
+        id,
+        o,
+        compress,
+    );
+    write!(
+        out,
+        "\x1b_Ga=a,i={id},q=2,r=1,z={}\x1b\\",
+        frames[0].delay_ms
+    )
+    .unwrap();
     // The canvas of every frame is fully composited (GIF frames arrive as
     // complete pictures), so `X=1` (simple overwrite) reproduces it exactly;
     // the default alpha blend would double-blend semi-transparent pixels.
-    let opts = if compress { ",o=z" } else { "" };
-    for frame in &frames[1..] {
-        let b64 = z64(&frame.img.to_rgba8(), compress);
-        write_chunked(
+    for (n, frame) in frames[1..].iter().enumerate() {
+        let f = frame.img.to_rgba8();
+        emit_frame(
             &mut out,
-            &b64,
-            &format!(
-                "a=f,f=32,s={w},v={h},i={id},q=2,X=1{opts},z={}",
-                frame.delay_ms
-            ),
+            &format!("a=f,s={w},v={h},i={id},q=2,X=1,z={}", frame.delay_ms),
             "a=f",
+            &f,
+            id,
+            o,
+            compress,
         );
+        if n == 0 {
+            // icat order: once the first extra frame has arrived, switch the
+            // animation to loading mode (s=2) so playback starts only when
+            // every frame is in.
+            write!(out, "\x1b_Ga=a,i={id},q=2,s=2\x1b\\").unwrap();
+        }
     }
+    write!(out, "\x1b_Ga=a,i={id},q=2,s=3,v={v}\x1b\\").unwrap();
+    // Park the cursor below the root image (same C=0 placement semantics as
+    // the static path: the a=a / a=f controls never move the cursor).
+    out.extend_from_slice(b"\r\n");
     out
 }
 
@@ -143,6 +223,68 @@ fn encode(rgba: &image::RgbaImage, w: u32, h: u32, id: u32, compress: bool) -> V
         "",
     );
     out
+}
+
+/// The wire payload for one image/frame: fully opaque bitmaps go as `f=24`
+/// RGB (a third smaller, verified against icat's `IsOpaque` branch), anything
+/// with alpha as `f=32` RGBA. Returns the format code and raw bytes.
+fn payload(rgba: &image::RgbaImage) -> (u32, Vec<u8>) {
+    if rgba.pixels().all(|p| p.0[3] == 255) {
+        let mut rgb = Vec::with_capacity(rgba.width() as usize * rgba.height() as usize * 3);
+        for px in rgba.pixels() {
+            rgb.extend_from_slice(&px.0[..3]);
+        }
+        (24, rgb)
+    } else {
+        (32, rgba.as_raw().clone())
+    }
+}
+
+/// Transmit one image/frame payload for the direct-placement path. `keys`/
+/// `cont` are the control keys of the opening and continuation blocks (e.g.
+/// `a=T,s=800,v=600,i=42,q=2` with empty `cont`). The format comes from
+/// `payload` (opaque → f=24 RGB, alpha → f=32 RGBA) and the transport from
+/// `o.transfer`: a temp file whose PATH alone crosses the pty (`t=t`, kitty
+/// reads the pixels and deletes the file), or the chunked pty stream,
+/// optionally zlib-compressed (`o=z`). A temp file that cannot be created
+/// falls back to the stream.
+fn emit_frame(
+    out: &mut Vec<u8>,
+    keys: &str,
+    cont: &str,
+    rgba: &image::RgbaImage,
+    id: u32,
+    o: &RenderOpts,
+    compress: bool,
+) {
+    let (fmt, bytes) = payload(rgba);
+    if o.transfer == KgpTransfer::Tempfile {
+        // The name must carry kitty's `tty-graphics-protocol` marker or kitty
+        // will not delete the file after reading it (graphics.c gates the
+        // unlink on that substring), leaking one file per image. The letter
+        // form `t=t` is mandatory: kitty silently drops the numeric `t=1`
+        // (verified live — no response, file never read), while `t=t`
+        // answers OK and deletes the file after reading it.
+        let path = std::env::temp_dir().join(format!("kitty-tty-graphics-protocol-isee-{id}.rgb"));
+        if std::fs::write(&path, &bytes).is_ok() {
+            let b64 = base64_encode(path.to_string_lossy().as_bytes());
+            write!(out, "\x1b_G{keys},f={fmt},t=t;{b64}\x1b\\").unwrap();
+            return;
+        }
+    }
+    stream_frame(out, keys, cont, fmt, &bytes, compress);
+}
+
+fn stream_frame(out: &mut Vec<u8>, keys: &str, cont: &str, fmt: u32, bytes: &[u8], compress: bool) {
+    let b64 = if compress {
+        let mut z = ZlibEncoder::new(Vec::new(), Compression::fast());
+        z.write_all(bytes).unwrap();
+        base64_encode(&z.finish().unwrap())
+    } else {
+        base64_encode(bytes)
+    };
+    let opts = if compress { ",o=z" } else { "" };
+    write_chunked(out, &b64, &format!("{keys},f={fmt}{opts}"), cont);
 }
 
 const CHUNK_BYTES: usize = 4096;
@@ -550,6 +692,8 @@ mod tests {
                 px: None,
             },
             dpy_scale: 1,
+            tmux: false,
+            transfer: KgpTransfer::Stream,
         }
     }
 
@@ -562,12 +706,14 @@ mod tests {
     }
 
     #[test]
-    fn wide_grid_never_exceeds_diacritics_table() {
+    fn tmux_wide_grid_never_exceeds_diacritics_table() {
         // A 400-column grid of 10 px cells would need 400 column diacritics,
         // but the table only holds 297 (kitty's rowcolumn-diacritics.txt).
-        // The bounds clamp must keep the grid within it; the old fallback to
-        // diacritic 0 rendered everything right of column 296 as garbage.
+        // The tmux bounds clamp must keep the grid within it; the old
+        // fallback to diacritic 0 rendered everything right of column 296 as
+        // garbage.
         let mut o = opts();
+        o.tmux = true;
         o.win = crate::detect::WinSize {
             cols: 400,
             rows: 40,
@@ -583,6 +729,29 @@ mod tests {
         '\u{10EEEE}'.encode_utf8(&mut marker);
         let placeholders = out.windows(4).filter(|w| *w == marker).count();
         assert_eq!(placeholders, 297 * 5);
+    }
+
+    #[test]
+    fn direct_wide_image_is_not_clamped() {
+        // Non-tmux direct placement has no placeholder grid, so a 3000 px
+        // wide request on a 400-col terminal is NOT shrunk to 2970 px.
+        let mut o = opts();
+        o.tmux = false;
+        o.win = crate::detect::WinSize {
+            cols: 400,
+            rows: 40,
+            px: None,
+        };
+        o.cell = crate::detect::CellPx { w: 10, h: 20 };
+        o.width = Some(3000);
+        let img = image::DynamicImage::new_rgba8(3000, 100);
+        let out = render(&img, &o, 42);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("a=T,s=3000,v=100,i=42,q=2,f=32,"),
+            "native size kept, got {s}"
+        );
+        assert!(!s.contains('\u{10EEEE}'), "no placeholders: {s}");
     }
 
     #[test]
@@ -623,9 +792,11 @@ mod tests {
     }
 
     #[test]
-    fn control_uses_placeholder_without_cr() {
+    fn tmux_control_uses_placeholder_without_cr() {
         let img = DynamicImage::new_rgba8(2, 1);
-        let out = render_with(&img, &opts(), 42, false);
+        let mut o = opts();
+        o.tmux = true;
+        let out = render_with(&img, &o, 42, false);
         let s = String::from_utf8_lossy(&out);
         assert!(
             s.starts_with("\x1b_Ga=T,C=1,U=1,f=32,s=2,v=1,i=42,q=2,m=0;"),
@@ -638,11 +809,33 @@ mod tests {
     }
 
     #[test]
-    fn hidpi_grid_uses_physical_cell() {
+    fn direct_control_places_without_placeholder() {
+        // icat-style direct placement: no C=1 (the terminal moves the cursor
+        // itself), no U=1/placeholder grid, and a trailing CR LF that parks
+        // the cursor below the image.
+        let img = DynamicImage::new_rgba8(2, 1);
+        let out = render_with(&img, &opts(), 42, false);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.starts_with("\r\x1b_Ga=T,s=2,v=1,i=42,q=2,f=32,m=0;"),
+            "got {s}"
+        );
+        let control = &s[..s.find(';').unwrap()];
+        assert!(!control.contains("C="), "{s}");
+        assert!(!control.contains("U="), "{s}");
+        assert!(!control.contains("c="), "{s}");
+        assert!(!control.contains("r="), "{s}");
+        assert!(!s.contains('\u{10EEEE}'), "no placeholders: {s}");
+        assert!(s.ends_with("\x1b\\\r\n"), "trailing CRLF: {s}");
+    }
+
+    #[test]
+    fn tmux_hidpi_grid_uses_physical_cell() {
         // Retina: 80x24 grid, window px 1440x864 (device), probed cell 9x18
         // (logical). The placeholder grid must use the physical 18x36 cell so
         // it matches the image's rendered size instead of doubling it.
         let mut o = opts();
+        o.tmux = true;
         o.win.px = Some((1440, 864));
         let img = DynamicImage::new_rgba8(982, 548);
         let out = render_with(&img, &o, 42, false);
@@ -656,40 +849,57 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_grid_tracks_image_size() {
+    fn direct_hidpi_sends_native_pixels_without_grid() {
+        let mut o = opts();
+        o.win.px = Some((1440, 864));
+        let img = DynamicImage::new_rgba8(982, 548);
+        let out = render_with(&img, &o, 42, false);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.starts_with("\r\x1b_Ga=T,s=982,v=548,i=42,q=2,f=32,m=1;"),
+            "got {s}"
+        );
+        assert!(!s.contains('\u{10EEEE}'), "{s}");
+    }
+
+    #[test]
+    fn tmux_placeholder_grid_tracks_image_size() {
         // 2x1 px with 9x18 cell => 1x1 placeholder grid, fg encodes id (0,0,42).
+        let mut o = opts();
+        o.tmux = true;
         let img = DynamicImage::new_rgba8(2, 1);
-        let out = render(&img, &opts(), 42);
+        let out = render(&img, &o, 42);
         let s = String::from_utf8_lossy(&out);
         assert_eq!(s.matches('\u{10EEEE}').count(), 1);
         assert!(s.contains("\x1b[38;2;0;0;42m"), "got {s}");
 
         // 36px tall with 18px cell.height => 2 rows => 2 placeholders.
         let img = DynamicImage::new_rgba8(2, 36);
-        let out = render(&img, &opts(), 42);
+        let out = render(&img, &o, 42);
         let s = String::from_utf8_lossy(&out);
         assert_eq!(s.matches('\u{10EEEE}').count(), 2);
     }
 
     #[test]
-    fn non_whole_cell_image_sends_native_pixel_size() {
+    fn direct_non_whole_cell_image_sends_native_pixel_size() {
         // 400x300 px with 9x18 cell must NOT be snapped to a whole-cell size
         // (396x306 or 405x306): s/v report the real RGBA dimensions.
         let img = DynamicImage::new_rgba8(400, 300);
         let out = render_with(&img, &opts(), 42, false);
         let s = String::from_utf8_lossy(&out);
         assert!(
-            s.starts_with("\x1b_Ga=T,C=1,U=1,f=32,s=400,v=300,i=42,q=2,m=1;"),
+            s.starts_with("\r\x1b_Ga=T,s=400,v=300,i=42,q=2,f=32,m=1;"),
             "got {s}"
         );
-        // ceil(400/9)=45 cols, ceil(300/18)=17 rows.
-        assert_eq!(s.matches('\u{10EEEE}').count(), 45 * 17);
+        assert!(!s.contains('\u{10EEEE}'), "{s}");
     }
 
     #[test]
-    fn multiline_placeholder_separates_rows_with_crlf() {
+    fn tmux_multiline_placeholder_separates_rows_with_crlf() {
+        let mut o = opts();
+        o.tmux = true;
         let img = DynamicImage::new_rgba8(2, 36);
-        let out = render(&img, &opts(), 42);
+        let out = render(&img, &o, 42);
         let s = std::str::from_utf8(&out).unwrap();
         // Rows are plain text lines separated by CRLF, plus one trailing CRLF
         // that parks the cursor below the image; no bare LF and no cursor
@@ -712,6 +922,63 @@ mod tests {
         assert!(s.ends_with("\x1b[0m\r\n"));
     }
 
+    // ---- direct placement: f=24 for opaque bitmaps ----
+
+    #[test]
+    fn direct_opaque_image_uses_rgb_f24() {
+        let mut raw = image::RgbaImage::new(2, 1);
+        for px in raw.pixels_mut() {
+            *px = image::Rgba([10, 20, 30, 255]);
+        }
+        let img = DynamicImage::ImageRgba8(raw);
+        let out = render_with(&img, &opts(), 42, false);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.starts_with("\r\x1b_Ga=T,s=2,v=1,i=42,q=2,f=24,m=0;"),
+            "got {s}"
+        );
+        // Payload is 2*1*3 = 6 RGB bytes -> 8 base64 chars.
+        let start = s.find(';').unwrap() + 1;
+        let end = s.find("\x1b\\").unwrap();
+        assert_eq!(end - start, 8, "{s}");
+    }
+
+    #[test]
+    fn direct_image_with_alpha_uses_rgba_f32() {
+        // new_rgba8 pixels have alpha 0: not opaque, stays f=32.
+        let img = DynamicImage::new_rgba8(2, 1);
+        let out = render_with(&img, &opts(), 42, false);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.starts_with("\r\x1b_Ga=T,s=2,v=1,i=42,q=2,f=32,m=0;"),
+            "got {s}"
+        );
+    }
+
+    // ---- direct placement: tempfile transport ----
+
+    #[test]
+    fn direct_tempfile_transfer_sends_path_only() {
+        let mut raw = image::RgbaImage::new(2, 1);
+        for px in raw.pixels_mut() {
+            *px = image::Rgba([1, 2, 3, 255]);
+        }
+        let img = DynamicImage::ImageRgba8(raw);
+        let mut o = opts();
+        o.transfer = KgpTransfer::Tempfile;
+        let out = render_with(&img, &o, 42, false);
+        let s = String::from_utf8_lossy(&out);
+        let path = std::env::temp_dir().join("kitty-tty-graphics-protocol-isee-42.rgb");
+        let want = format!(
+            "\r\x1b_Ga=T,s=2,v=1,i=42,q=2,f=24,t=t;{}\x1b\\\r\n",
+            base64_encode(path.to_string_lossy().as_bytes())
+        );
+        assert_eq!(s, want, "single block carrying the file path: {s}");
+        // The file holds the raw RGB payload; nothing else crossed the pty.
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 3, 1, 2, 3]);
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ---- GIF animation ----
 
     fn anim_frame(w: u32, h: u32, delay_ms: u32) -> AnimFrame {
@@ -722,13 +989,15 @@ mod tests {
     }
 
     #[test]
-    fn animation_transmits_root_then_frames_and_starts() {
+    fn tmux_animation_transmits_root_then_frames_and_starts() {
         let frames = [
             anim_frame(8, 4, 70),
             anim_frame(8, 4, 30),
             anim_frame(8, 4, 10),
         ];
-        let out = render_animation_with(&frames, LoopCount::Infinite, &opts(), 42, false);
+        let mut o = opts();
+        o.tmux = true;
+        let out = render_animation_with(&frames, LoopCount::Infinite, &o, 42, false);
         let s = String::from_utf8_lossy(&out);
         assert!(
             s.starts_with("\x1b_Ga=T,C=1,U=1,f=32,s=8,v=4,i=42,q=2,m="),
@@ -755,6 +1024,53 @@ mod tests {
         assert_eq!(s.matches("\x1b_G").count(), 5);
         // 8x4 with a 9x18 cell fits in a single placeholder cell.
         assert_eq!(s.matches('\u{10EEEE}').count(), 1);
+        // No loading mode inside tmux: the legacy sequence is byte-identical.
+        assert!(!s.contains("s=2"), "{s}");
+    }
+
+    #[test]
+    fn direct_animation_root_frames_loading_then_start() {
+        // icat order: root a=T, gap control, frames with an s=2 loading-mode
+        // control right after the first extra frame, s=3 start at the end,
+        // and a trailing CR LF parking the cursor below the root image.
+        let frames = [
+            anim_frame(8, 4, 70),
+            anim_frame(8, 4, 30),
+            anim_frame(8, 4, 10),
+        ];
+        let out = render_animation_with(&frames, LoopCount::Infinite, &opts(), 42, false);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.starts_with("\r\x1b_Ga=T,s=8,v=4,i=42,q=2,f=32,m="),
+            "root frame first: {s}"
+        );
+        assert!(
+            s.contains("\x1b_Ga=a,i=42,q=2,r=1,z=70\x1b\\"),
+            "root frame gap: {s}"
+        );
+        assert!(
+            s.contains("\x1b_Ga=f,s=8,v=4,i=42,q=2,X=1,z=30,f=32,m=0;"),
+            "second frame: {s}"
+        );
+        assert!(
+            s.contains("\x1b_Ga=f,s=8,v=4,i=42,q=2,X=1,z=10,f=32,m=0;"),
+            "third frame: {s}"
+        );
+        assert!(
+            s.contains("\x1b_Ga=a,i=42,q=2,s=2\x1b\\"),
+            "loading mode: {s}"
+        );
+        assert!(
+            s.contains("\x1b_Ga=a,i=42,q=2,s=3,v=1\x1b\\"),
+            "start control: {s}"
+        );
+        assert_eq!(s.matches("\x1b_G").count(), 6);
+        // s=2 sits between the first and second a=f frame.
+        let first_f = s.find("\x1b_Ga=f").unwrap();
+        let s2 = s.find("s=2\x1b\\").unwrap();
+        let second_f = s[first_f + 1..].find("\x1b_Ga=f").unwrap() + first_f + 1;
+        assert!(first_f < s2 && s2 < second_f, "s=2 after frame 1: {s}");
+        assert!(s.ends_with("\x1b\\\r\n"), "{s}");
     }
 
     #[test]
@@ -773,6 +1089,22 @@ mod tests {
     }
 
     #[test]
+    fn tmux_animation_loop_count_maps_to_kitty_v() {
+        let frames = [anim_frame(8, 4, 50), anim_frame(8, 4, 50)];
+        let mut o = opts();
+        o.tmux = true;
+        let out = render_animation_with(
+            &frames,
+            LoopCount::Finite(std::num::NonZeroU32::new(2).unwrap()),
+            &o,
+            7,
+            false,
+        );
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b_Ga=a,i=7,q=2,s=3,v=3\x1b\\"), "{s}");
+    }
+
+    #[test]
     fn animation_frame_chunks_carry_a_f_on_continuation() {
         let frames = [anim_frame(40, 20, 50), anim_frame(40, 20, 50)];
         let out = render_animation_with(&frames, LoopCount::Infinite, &opts(), 9, false);
@@ -780,16 +1112,18 @@ mod tests {
         // 40x20 RGBA = 3200 B -> 4268 base64 chars -> two blocks under the
         // 4096-byte cap, and every later block must re-declare a=f.
         assert!(
-            s.contains("a=f,f=32,s=40,v=20,i=9,q=2,X=1,z=50,m=1;"),
+            s.contains("a=f,s=40,v=20,i=9,q=2,X=1,z=50,f=32,m=1;"),
             "first block: {s}"
         );
         assert!(s.contains("\x1b_Ga=f,m=0;"), "continuation block: {s}");
     }
 
     #[test]
-    fn animation_compressed_frames_declare_o_z() {
+    fn tmux_animation_compressed_frames_declare_o_z() {
         let frames = [anim_frame(8, 4, 50), anim_frame(8, 4, 50)];
-        let out = render_animation_with(&frames, LoopCount::Infinite, &opts(), 11, true);
+        let mut o = opts();
+        o.tmux = true;
+        let out = render_animation_with(&frames, LoopCount::Infinite, &o, 11, true);
         let s = String::from_utf8_lossy(&out);
         assert!(
             s.starts_with("\x1b_Ga=T,C=1,U=1,f=32,s=8,v=4,i=11,q=2,o=z,m="),
@@ -797,6 +1131,21 @@ mod tests {
         );
         assert!(
             s.contains("\x1b_Ga=f,f=32,s=8,v=4,i=11,q=2,X=1,o=z,z=50,m=0;"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn direct_animation_compressed_frames_declare_o_z() {
+        let frames = [anim_frame(8, 4, 50), anim_frame(8, 4, 50)];
+        let out = render_animation_with(&frames, LoopCount::Infinite, &opts(), 11, true);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.starts_with("\r\x1b_Ga=T,s=8,v=4,i=11,q=2,f=32,o=z,m="),
+            "{s}"
+        );
+        assert!(
+            s.contains("\x1b_Ga=f,s=8,v=4,i=11,q=2,X=1,z=50,f=32,o=z,m=0;"),
             "{s}"
         );
     }
