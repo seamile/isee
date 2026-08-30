@@ -12,6 +12,13 @@ use crate::size::{self, KgpTransfer, RenderOpts};
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 
+/// Sequence number for tempfile transport: every transfer gets its own file
+/// because kitty deletes each one after reading it — an animation shares one
+/// image id across root and frames, so reusing `{id}.rgb` would overwrite
+/// the root's payload with a frame's (or lose frames entirely once kitty had
+/// deleted the shared file), leaving a static first image.
+static NEXT_TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
+
 /// zlib-compressed KGP transfer, ON by default, opt out via
 /// `ISEE_KGP_COMPRESS=0` (also `false`/`no`/`off`, case-insensitive): raw
 /// RGBA payloads (~2.9 MB for a 900x600 image) dominate the wall time a
@@ -264,8 +271,12 @@ fn emit_frame(
         // unlink on that substring), leaking one file per image. The letter
         // form `t=t` is mandatory: kitty silently drops the numeric `t=1`
         // (verified live — no response, file never read), while `t=t`
-        // answers OK and deletes the file after reading it.
-        let path = std::env::temp_dir().join(format!("kitty-tty-graphics-protocol-isee-{id}.rgb"));
+        // answers OK and deletes the file after reading it. The per-transfer
+        // seq suffix keeps an animation's root and frames from sharing one
+        // path (see `NEXT_TEMP_SEQ`).
+        let seq = NEXT_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("kitty-tty-graphics-protocol-isee-{id}-{seq}.rgb"));
         if std::fs::write(&path, &bytes).is_ok() {
             let b64 = base64_encode(path.to_string_lossy().as_bytes());
             write!(out, "\x1b_G{keys},f={fmt},t=t;{b64}\x1b\\").unwrap();
@@ -968,15 +979,64 @@ mod tests {
         o.transfer = KgpTransfer::Tempfile;
         let out = render_with(&img, &o, 42, false);
         let s = String::from_utf8_lossy(&out);
-        let path = std::env::temp_dir().join("kitty-tty-graphics-protocol-isee-42.rgb");
-        let want = format!(
-            "\r\x1b_Ga=T,s=2,v=1,i=42,q=2,f=24,t=t;{}\x1b\\\r\n",
-            base64_encode(path.to_string_lossy().as_bytes())
+        // Single block carrying the file path: the seq suffix varies with
+        // test order, so match the structure instead of a literal path.
+        assert!(
+            s.starts_with("\r\x1b_Ga=T,s=2,v=1,i=42,q=2,f=24,t=t;"),
+            "{s}"
         );
-        assert_eq!(s, want, "single block carrying the file path: {s}");
+        assert!(s.ends_with("\x1b\\\r\n"), "{s}");
+        let payload = &s[s.find("t=t;").unwrap() + 4..s.find("\x1b\\").unwrap()];
+        assert!(
+            !payload.contains(',') && !s.contains("o=z"),
+            "one block: {s}"
+        );
         // The file holds the raw RGB payload; nothing else crossed the pty.
+        let path = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with("kitty-tty-graphics-protocol-isee-42-") && n.ends_with(".rgb")
+                })
+            })
+            .expect("tempfile written");
         assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 3, 1, 2, 3]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn animation_frames_get_distinct_tempfiles() {
+        // The root and every frame share one image id, but each transfer
+        // must write its own file: kitty deletes a tempfile right after
+        // reading it, so a shared name would overwrite the root's payload
+        // with a frame's data and strand every later frame (EBADF, hidden
+        // by q=2), stalling the animation after the first image.
+        let frames = [
+            anim_frame(8, 4, 50),
+            anim_frame(8, 4, 50),
+            anim_frame(8, 4, 50),
+        ];
+        let mut o = opts();
+        o.transfer = KgpTransfer::Tempfile;
+        let out = render_animation_with(&frames, LoopCount::Infinite, &o, 77, false);
+        let s = String::from_utf8_lossy(&out);
+        let paths: Vec<&str> = s
+            .split("t=t;")
+            .skip(1)
+            .filter_map(|c| c.split('\x1b').next())
+            .collect();
+        assert_eq!(paths.len(), frames.len(), "root + 2 frame transfers: {s}");
+        let mut unique = paths.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), paths.len(), "distinct paths: {paths:?}");
+        for p in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
+            let name = p.file_name().to_string_lossy().into_owned();
+            if name.starts_with("kitty-tty-graphics-protocol-isee-77-") {
+                let _ = std::fs::remove_file(p.path());
+            }
+        }
     }
 
     // ---- GIF animation ----
