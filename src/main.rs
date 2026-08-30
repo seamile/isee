@@ -216,11 +216,12 @@ fn wrap_tmux(block: Vec<u8>, term: &detect::TerminalInfo) -> Vec<u8> {
     }
 }
 
-/// Render a loaded source to a protocol block. A GIF animation renders
-/// animated on Kitty (native animation protocol) and on iTerm2/mintty
-/// (OSC 1337 passes the raw GIF through for the terminal to play); everywhere
-/// else the first frame is shown as a static image. Pure function of
-/// (loaded, term, opts): safe to call from worker threads.
+/// Render a loaded source to a protocol block. An animation renders animated
+/// on Kitty (native animation protocol) and, when it is a GIF, on
+/// iTerm2/mintty (OSC 1337 passes the raw GIF through for the terminal to
+/// play); animated WebPs and every other protocol show the first frame as a
+/// static image. Pure function of (loaded, term, opts): safe to call from
+/// worker threads.
 fn render_loaded(
     loaded: &input::Loaded,
     term: &detect::TerminalInfo,
@@ -228,15 +229,18 @@ fn render_loaded(
 ) -> Vec<u8> {
     match loaded {
         input::Loaded::Static(img) => render_block(img, term, opts),
-        input::Loaded::Gif(anim) => {
+        input::Loaded::Anim(anim) => {
             let animated = match term.protocol {
                 Protocol::Kitty => true,
                 // Only the OSC 1337 brands that actually play GIF payloads
                 // animate; the rest (Warp, VSCode, ...) show the first frame.
-                Protocol::Iip => matches!(
-                    term.brand,
-                    Some(brand::Brand::Iterm2) | Some(brand::Brand::Mintty)
-                ),
+                Protocol::Iip => {
+                    anim.kind == input::AnimKind::Gif
+                        && matches!(
+                            term.brand,
+                            Some(brand::Brand::Iterm2) | Some(brand::Brand::Mintty)
+                        )
+                }
                 _ => false,
             };
             let block = if animated {
@@ -563,14 +567,15 @@ mod tests {
     }
 
     #[test]
-    fn loaded_dims_static_and_gif_canvas() {
+    fn loaded_dims_static_and_anim_canvas() {
         let img = image::DynamicImage::new_rgba8(4, 4);
         assert_eq!(input::Loaded::Static(img).dims(), (4, 4));
-        // Animations report the raw GIF canvas, not the resized frames.
+        // Animations report the raw header canvas, not the resized frames.
         let mut raw = b"GIF89a".to_vec();
         raw.extend_from_slice(&1000u16.to_le_bytes());
         raw.extend_from_slice(&6000u16.to_le_bytes());
-        let anim = input::GifAnimation {
+        let anim = input::Animation {
+            kind: input::AnimKind::Gif,
             raw,
             frames: vec![
                 input::AnimFrame {
@@ -584,7 +589,30 @@ mod tests {
             ],
             loop_count: image::metadata::LoopCount::Infinite,
         };
-        assert_eq!(input::Loaded::Gif(anim).dims(), (1000, 6000));
+        assert_eq!(input::Loaded::Anim(anim).dims(), (1000, 6000));
+        // A WebP canvas comes from the VP8X chunk's u24 (width-1, height-1).
+        let mut webp_raw = b"RIFF\x12\x00\x00\x00WEBP".to_vec();
+        webp_raw.extend_from_slice(b"VP8X");
+        webp_raw.extend_from_slice(&10u32.to_le_bytes());
+        webp_raw.extend_from_slice(&[0, 0, 0, 0]); // flags + reserved
+        webp_raw.extend_from_slice(&[0x87, 0x13, 0x00]); // width-1 = 4999
+        webp_raw.extend_from_slice(&[0xbf, 0x2b, 0x00]); // height-1 = 11199
+        let anim = input::Animation {
+            kind: input::AnimKind::Webp,
+            raw: webp_raw,
+            frames: vec![
+                input::AnimFrame {
+                    img: image::DynamicImage::new_rgba8(30, 30),
+                    delay_ms: 50,
+                },
+                input::AnimFrame {
+                    img: image::DynamicImage::new_rgba8(30, 30),
+                    delay_ms: 50,
+                },
+            ],
+            loop_count: image::metadata::LoopCount::Infinite,
+        };
+        assert_eq!(input::Loaded::Anim(anim).dims(), (5000, 11200));
     }
 
     // ---- GIF animation dispatch ----
@@ -627,7 +655,8 @@ mod tests {
     }
 
     fn gif_loaded() -> input::Loaded {
-        input::Loaded::Gif(input::GifAnimation {
+        input::Loaded::Anim(input::Animation {
+            kind: input::AnimKind::Gif,
             raw: b"GIF89a-fake-frames".to_vec(),
             frames: vec![
                 input::AnimFrame {

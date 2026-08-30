@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{self, Cursor, Read};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use image::metadata::{LoopCount, Orientation};
 use image::{
     AnimationDecoder, ColorType, DynamicImage, GenericImageView, ImageDecoder, ImageReader,
 };
+use image_webp::WebPDecoder;
 use jpeg_decoder::PixelFormat;
 
 use crate::meta;
@@ -444,24 +446,46 @@ fn decode_svg(buf: &[u8]) -> Result<DynamicImage, Box<dyn std::error::Error>> {
     Ok(DynamicImage::ImageRgba8(img))
 }
 
-/// A loaded preview source: one static image, or an animated GIF with every
+/// A loaded preview source: one static image, or an animation with every
 /// frame decoded (opted in via `-a`).
 pub enum Loaded {
     Static(DynamicImage),
-    Gif(GifAnimation),
+    Anim(Animation),
 }
 
 impl Loaded {
     /// Pixel dimensions to size a preview from: the static image itself, or
-    /// the animated GIF's raw canvas from the file header — frames are
-    /// already resized to the shared preview target, so the header is the
-    /// only place the original dimensions survive.
+    /// the animation's raw canvas from the file header — frames are already
+    /// resized to the shared preview target, so the header is the only place
+    /// the original dimensions survive.
     pub fn dims(&self) -> (u32, u32) {
         match self {
             Loaded::Static(img) => img.dimensions(),
-            Loaded::Gif(anim) => gif_canvas(&anim.raw),
+            Loaded::Anim(anim) => match anim.kind {
+                AnimKind::Gif => gif_canvas(&anim.raw),
+                AnimKind::Webp => webp_canvas(&anim.raw),
+            },
         }
     }
+}
+
+/// Which container an `Animation` was decoded from. The kind decides the
+/// raw-passthrough behavior: OSC 1337 terminals replay raw GIF bytes, but
+/// none of them renders an animated WebP payload.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AnimKind {
+    Gif,
+    Webp,
+}
+
+/// An animation: composited full-canvas frames plus the loop count from the
+/// container header. The original bytes are kept so terminals that animate
+/// GIFs themselves (OSC 1337) can pass the file through unmodified.
+pub struct Animation {
+    pub kind: AnimKind,
+    pub raw: Vec<u8>,
+    pub frames: Vec<AnimFrame>,
+    pub loop_count: LoopCount,
 }
 
 /// Logical screen size from a GIF header: little-endian u16 canvas width at
@@ -472,6 +496,35 @@ fn gif_canvas(raw: &[u8]) -> (u32, u32) {
     }
     let le = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]) as u32;
     (le(&raw[6..8]).max(1), le(&raw[8..10]).max(1))
+}
+
+/// Canvas size from a WebP VP8X chunk: three-byte little-endian (width-1,
+/// height-1) after the 4-byte flags/reserved prefix. Animated WebPs are
+/// always extended-format files, so the first VP8X carries the canvas; a
+/// missing or truncated chunk falls back to 1x1.
+fn webp_canvas(raw: &[u8]) -> (u32, u32) {
+    if raw.len() < 12 || &raw[0..4] != b"RIFF" || &raw[8..12] != b"WEBP" {
+        return (1, 1);
+    }
+    let mut off = 12usize;
+    while off + 8 <= raw.len() {
+        let size =
+            u32::from_le_bytes([raw[off + 4], raw[off + 5], raw[off + 6], raw[off + 7]]) as usize;
+        let data = off + 8;
+        if &raw[off..off + 4] == b"VP8X" {
+            if raw.len() >= data + 10 {
+                let u24 = |b: &[u8]| u32::from(b[0]) | u32::from(b[1]) << 8 | u32::from(b[2]) << 16;
+                return (
+                    u24(&raw[data + 4..data + 7]) + 1,
+                    u24(&raw[data + 7..data + 10]) + 1,
+                );
+            }
+            return (1, 1);
+        }
+        // RIFF chunks pad their payload out to an even size.
+        off = data + size + (size & 1);
+    }
+    (1, 1)
 }
 
 pub fn load(
@@ -485,7 +538,13 @@ pub fn load(
         && is_gif(&buf)
         && let Ok(anim) = decode_gif(&buf, opts, bounds, opts.dpy_scale)
     {
-        return Ok(Loaded::Gif(anim));
+        return Ok(Loaded::Anim(anim));
+    }
+    if animate
+        && is_webp(&buf)
+        && let Ok(anim) = decode_webp(&buf, opts, bounds, opts.dpy_scale)
+    {
+        return Ok(Loaded::Anim(anim));
     }
     let img = decode_for_preview(&buf, opts, bounds, opts.dpy_scale)?;
     Ok(Loaded::Static(img))
@@ -496,16 +555,6 @@ pub struct AnimFrame {
     pub img: DynamicImage,
     /// Gap to the next frame in whole milliseconds (at least 1).
     pub delay_ms: u32,
-}
-
-/// An animated GIF: composited full-canvas frames plus the loop count from
-/// the file's Netscape extension. The original bytes are kept so terminals
-/// that animate GIFs themselves (OSC 1337) can pass the file through
-/// unmodified.
-pub struct GifAnimation {
-    pub raw: Vec<u8>,
-    pub frames: Vec<AnimFrame>,
-    pub loop_count: LoopCount,
 }
 
 /// Decode an animated GIF into composited full-canvas frames (`GifDecoder`
@@ -521,7 +570,7 @@ fn decode_gif(
     opts: &RenderOpts,
     bounds: size::Bounds,
     dpy_scale: u32,
-) -> Result<GifAnimation, Box<dyn std::error::Error>> {
+) -> Result<Animation, Box<dyn std::error::Error>> {
     // The GIF signature was verified by the caller (`is_gif`), so no format
     // guessing is needed; `GifDecoder::new` takes the reader directly.
     let decoder = GifDecoder::new(Cursor::new(buf))?;
@@ -566,7 +615,98 @@ fn decode_gif(
     if frames.len() < 2 {
         return Err("GIF has fewer than two frames".into());
     }
-    Ok(GifAnimation {
+    Ok(Animation {
+        kind: AnimKind::Gif,
+        raw: buf.to_vec(),
+        frames,
+        loop_count,
+    })
+}
+
+/// Detect a WebP by its RIFF container signature, before any decode, so the
+/// animation path can be gated on `-a`.
+fn is_webp(buf: &[u8]) -> bool {
+    buf.len() >= 12 && &buf[0..4] == b"RIFF" && &buf[8..12] == b"WEBP"
+}
+
+/// Decode an animated WebP into composited full-canvas frames. `image`'s
+/// top-level API exposes only static WebP decoding, so this drives
+/// `image-webp`'s decoder directly: `reset_animation` positions the reader at
+/// the first ANMF chunk (the chunk table is built during construction), and
+/// each `read_frame` blends one frame onto the canvas and reports its
+/// duration. The same guardrails as `decode_gif` apply; fewer than two
+/// frames — or a mid-stream failure before reaching two — is an error so the
+/// caller falls back to the static path.
+fn decode_webp(
+    buf: &[u8],
+    opts: &RenderOpts,
+    bounds: size::Bounds,
+    dpy_scale: u32,
+) -> Result<Animation, Box<dyn std::error::Error>> {
+    // The RIFF/WEBP signature was verified by the caller (`is_webp`).
+    let mut decoder = WebPDecoder::new(Cursor::new(buf))?;
+    if !decoder.is_animated() {
+        return Err("WebP has fewer than two frames".into());
+    }
+    let (cw, ch) = decoder.dimensions();
+    check_preview_size(cw, ch)?;
+    let Some(canvas_bytes) = decoder.output_buffer_size() else {
+        return Err("WebP animation has no output buffer".into());
+    };
+    check_preview_alloc(cw, ch, canvas_bytes as u64)?;
+    let loop_count = match decoder.loop_count() {
+        image_webp::LoopCount::Forever => LoopCount::Infinite,
+        image_webp::LoopCount::Times(n) => LoopCount::Finite(NonZeroU32::from(n)),
+    };
+    decoder.reset_animation();
+
+    let has_alpha = decoder.has_alpha();
+    let target = size::target_dims(cw.div_ceil(dpy_scale), ch.div_ceil(dpy_scale), opts, bounds);
+    let mut canvas = vec![0u8; canvas_bytes];
+    let mut frames: Vec<AnimFrame> = Vec::new();
+    let mut budget: u64 = 0;
+    loop {
+        let cost = u64::from(target.0) * u64::from(target.1) * 4;
+        if frames.len() >= ANIM_MAX_FRAMES || (!frames.is_empty() && budget + cost > ANIM_MAX_ALLOC)
+        {
+            break; // truncation at a frame boundary
+        }
+        match decoder.read_frame(&mut canvas) {
+            Ok(raw_delay) => {
+                let delay_ms = raw_delay.max(ANIM_MIN_DELAY_MS);
+                let base = if has_alpha {
+                    DynamicImage::ImageRgba8(
+                        image::RgbaImage::from_raw(cw, ch, canvas.clone())
+                            .ok_or("WebP frame buffer size mismatch")?,
+                    )
+                } else {
+                    DynamicImage::ImageRgb8(
+                        image::RgbImage::from_raw(cw, ch, canvas.clone())
+                            .ok_or("WebP frame buffer size mismatch")?,
+                    )
+                };
+                let img = if (cw, ch) == target {
+                    base
+                } else {
+                    base.resize_exact(target.0, target.1, size::filter(opts.quality))
+                };
+                budget += cost;
+                frames.push(AnimFrame { img, delay_ms });
+            }
+            Err(image_webp::DecodingError::NoMoreFrames) => break,
+            Err(err) => {
+                if frames.len() >= 2 {
+                    break; // keep whatever decoded cleanly so far
+                }
+                return Err(err.into());
+            }
+        }
+    }
+    if frames.len() < 2 {
+        return Err("WebP has fewer than two frames".into());
+    }
+    Ok(Animation {
+        kind: AnimKind::Webp,
         raw: buf.to_vec(),
         frames,
         loop_count,
@@ -1119,10 +1259,127 @@ mod tests {
         let without_flag = load(&Source::Path(path.clone()), &o, bounds, false).unwrap();
         assert!(matches!(without_flag, Loaded::Static(_)));
         let with_flag = load(&Source::Path(path.clone()), &o, bounds, true).unwrap();
-        let Loaded::Gif(anim) = with_flag else {
+        let Loaded::Anim(anim) = with_flag else {
             panic!("expected an animated load with -a");
         };
         assert_eq!(anim.frames.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- WebP animation ----
+
+    /// A tiny 3-frame 8x6 animation generated once with img2webp
+    /// (`img2webp -o anim.webp -loop 5 -d 80`): loop count 5, 80 ms gaps.
+    const WEBP_ANIM: &[u8] = include_bytes!("../tests/fixtures/anim.webp");
+
+    fn encode_webp_static(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(w, h))
+            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::WebP)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn detects_webp_signature() {
+        assert!(is_webp(b"RIFF\x12\x00\x00\x00WEBPVP8 "));
+        assert!(!is_webp(b"RIFF\x12\x00\x00\x00WAV "));
+        assert!(!is_webp(b"RIFF"));
+        assert!(!is_webp(b""));
+    }
+
+    #[test]
+    fn webp_canvas_parses_vp8x_and_falls_back() {
+        let u24 = |v: u32| [v as u8, (v >> 8) as u8, (v >> 16) as u8];
+        let mut raw = b"RIFF\x18\x00\x00\x00WEBP".to_vec();
+        raw.extend_from_slice(b"VP8X");
+        raw.extend_from_slice(&10u32.to_le_bytes());
+        raw.extend_from_slice(&[0, 0, 0, 0]); // flags + reserved
+        raw.extend_from_slice(&u24(4999)); // width-1
+        raw.extend_from_slice(&u24(11199)); // height-1
+        assert_eq!(webp_canvas(&raw), (5000, 11200));
+        // No VP8X (simple lossy file): the caller never asks, but stay safe.
+        assert_eq!(webp_canvas(&encode_webp_static(8, 6)), (1, 1));
+        assert_eq!(webp_canvas(b"RIFF\x12\x00\x00\x00WEBP"), (1, 1));
+        assert_eq!(webp_canvas(b""), (1, 1));
+    }
+
+    #[test]
+    fn decode_webp_extracts_composited_frames_and_loop_count() {
+        let o = opts_width(None);
+        let bounds = size::Bounds::window(10_000, 10_000);
+        let anim = decode_webp(WEBP_ANIM, &o, bounds, 1).unwrap();
+        assert_eq!(anim.kind, AnimKind::Webp);
+        assert_eq!(anim.frames.len(), 3);
+        for f in &anim.frames {
+            assert_eq!((f.img.width(), f.img.height()), (8, 6));
+            assert_eq!(f.delay_ms, 80);
+        }
+        if let LoopCount::Finite(n) = anim.loop_count {
+            assert_eq!(n.get(), 5);
+        } else {
+            panic!("expected a finite loop count");
+        }
+        assert_eq!(anim.raw, WEBP_ANIM);
+    }
+
+    #[test]
+    fn decode_webp_composites_each_frame_onto_canvas() {
+        // img2webp encodes the red/lime/blue fixture lossily; allow for that.
+        let expected = [[255u8, 0, 0], [0, 255, 0], [0, 0, 255]];
+        let o = opts_width(None);
+        let bounds = size::Bounds::window(10_000, 10_000);
+        let anim = decode_webp(WEBP_ANIM, &o, bounds, 1).unwrap();
+        for (f, rgb) in anim.frames.iter().zip(expected) {
+            let rgba = f.img.to_rgba8();
+            let px = rgba.get_pixel(4, 3);
+            for ch in 0..3 {
+                assert!(
+                    (i16::from(px[ch]) - i16::from(rgb[ch])).abs() <= 16,
+                    "frame {ch} pixel {px:?} vs {rgb:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_webp_resizes_all_frames_to_shared_target() {
+        let o = opts_width(Some(4));
+        let bounds = size::Bounds::window(100_000, 100_000);
+        let anim = decode_webp(WEBP_ANIM, &o, bounds, 1).unwrap();
+        assert_eq!(anim.frames.len(), 3);
+        for f in &anim.frames {
+            assert_eq!((f.img.width(), f.img.height()), (4, 3));
+        }
+    }
+
+    #[test]
+    fn load_returns_webp_only_when_animate_requested() {
+        let path = std::env::temp_dir().join(format!("isee_webp_{}.webp", std::process::id()));
+        std::fs::write(&path, WEBP_ANIM).unwrap();
+        let o = opts_width(None);
+        let bounds = size::Bounds::window(10_000, 10_000);
+        let without_flag = load(&Source::Path(path.clone()), &o, bounds, false).unwrap();
+        assert!(matches!(without_flag, Loaded::Static(_)));
+        let with_flag = load(&Source::Path(path.clone()), &o, bounds, true).unwrap();
+        let Loaded::Anim(anim) = with_flag else {
+            panic!("expected an animated load with -a");
+        };
+        assert_eq!(anim.frames.len(), 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_keeps_static_webp_static_even_with_animate() {
+        let buf = encode_webp_static(8, 6);
+        assert!(is_webp(&buf));
+        let o = opts_width(None);
+        let bounds = size::Bounds::window(10_000, 10_000);
+        let path =
+            std::env::temp_dir().join(format!("isee_webp_static_{}.webp", std::process::id()));
+        std::fs::write(&path, &buf).unwrap();
+        let loaded = load(&Source::Path(path.clone()), &o, bounds, true).unwrap();
+        assert!(matches!(loaded, Loaded::Static(_)));
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -287,6 +287,7 @@ version = "0.2.1"
 dependencies = [
  "flate2",
  "image",
+ "image-webp",
  "jpeg-decoder",
  "libc",
  "palette",

@@ -20,6 +20,10 @@ image  = { version = "0.25", default-features = false, features = [
     "bmp", "pnm", "qoi", "ff", "ico",
     "tiff", "hdr", "exr",
 ] }
+# Animated-WebP frames: `image` exposes only the static WebP decoder, so the
+# animation decode goes through image-webp's own API directly (already in the
+# lockfile as image's transitive dependency).
+image-webp = "0.2"
 jpeg-decoder = { version = "0.3.2", default-features = false }
 libc   = "0.2"
 flate2 = "1"
