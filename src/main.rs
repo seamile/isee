@@ -171,6 +171,7 @@ fn run_preview(
         let path = display_source(source);
         match input::load(source, &opts, bounds, args.animate) {
             Ok(loaded) => {
+                note_protocol_clamp(&loaded, &term, &opts);
                 let block = render_loaded(&loaded, &term, &opts);
                 emit_preview_item(&mut out, multi, term.protocol, wrote_before, &path, &block)
                     .map_err(|e| AppErr::Fatal(e.to_string()))?;
@@ -181,6 +182,23 @@ fn run_preview(
         }
     }
     Ok(())
+}
+
+/// Warn (at most once per run) when the kitty placeholder cap — not the
+/// terminal — forced a preview smaller than it would otherwise be shown.
+/// Other protocols have no placeholder grid and are never capped by it.
+fn note_protocol_clamp(
+    loaded: &input::Loaded,
+    term: &detect::TerminalInfo,
+    opts: &size::RenderOpts,
+) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if !matches!(term.protocol, Protocol::Kitty) {
+        return;
+    }
+    if let Some(msg) = size::kitty_protocol_clamp_notice(loaded.dims(), opts) {
+        ONCE.call_once(|| eprintln!("{msg}"));
+    }
 }
 
 /// Tmux passthrough for graphics escapes. Sixel is downgraded to Half Blocks
@@ -292,7 +310,11 @@ fn preview_parallel(
                         break;
                     }
                     let path = display_source(&sources[i]);
-                    let res = input::load(&sources[i], opts, bounds, animate)
+                    let res = input::load(&sources[i], opts, bounds, animate);
+                    if let Ok(loaded) = &res {
+                        note_protocol_clamp(loaded, term, opts);
+                    }
+                    let res = res
                         .map_err(|e| e.to_string())
                         .map(|loaded| render_loaded(&loaded, term, opts));
                     if tx.send((i, path, res)).is_err() {
@@ -534,6 +556,31 @@ mod tests {
         let src = input::Source::Path(PathBuf::from("foo//bar.png"));
         assert_eq!(display_source(&src), "foo//bar.png");
         assert_eq!(display_source(&input::Source::Stdin), "-");
+    }
+
+    #[test]
+    fn loaded_dims_static_and_gif_canvas() {
+        let img = image::DynamicImage::new_rgba8(4, 4);
+        assert_eq!(input::Loaded::Static(img).dims(), (4, 4));
+        // Animations report the raw GIF canvas, not the resized frames.
+        let mut raw = b"GIF89a".to_vec();
+        raw.extend_from_slice(&1000u16.to_le_bytes());
+        raw.extend_from_slice(&6000u16.to_le_bytes());
+        let anim = input::GifAnimation {
+            raw,
+            frames: vec![
+                input::AnimFrame {
+                    img: image::DynamicImage::new_rgba8(30, 30),
+                    delay_ms: 50,
+                },
+                input::AnimFrame {
+                    img: image::DynamicImage::new_rgba8(30, 30),
+                    delay_ms: 50,
+                },
+            ],
+            loop_count: image::metadata::LoopCount::Infinite,
+        };
+        assert_eq!(input::Loaded::Gif(anim).dims(), (1000, 6000));
     }
 
     // ---- GIF animation dispatch ----

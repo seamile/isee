@@ -20,8 +20,10 @@ debug/
 # Customs
 .codegraph/
 .DS_Store
+.ignore
 .kilo/
 .kilocodeignore
 .omo/
 AGENTS.md
 misc/
+reference/

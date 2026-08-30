@@ -182,6 +182,11 @@ fn write_chunked(out: &mut Vec<u8>, b64: &str, first: &str, cont: &str) {
 /// Anchor the transmitted image to a grid of terminal cells. The foreground
 /// color's 24-bit RGB value is set to the image id so the terminal associates
 /// these cells with the image.
+///
+/// `cols`/`rows` must stay within `MAX_PLACEHOLDER_CELLS` (enforced by
+/// `size::kitty_bounds`): the diacritics table cannot address larger offsets,
+/// and a past-the-end fallback to diacritic 0 used to render everything right
+/// of column 296 as garbage. Indexing directly panics on violation instead.
 fn place(out: &mut Vec<u8>, cols: u32, rows: u32, id: u32) {
     let (r, g, b) = ((id >> 16) & 0xff, (id >> 8) & 0xff, id & 0xff);
     write!(out, "\x1b[38;2;{r};{g};{b}m").unwrap();
@@ -196,9 +201,9 @@ fn place(out: &mut Vec<u8>, cols: u32, rows: u32, id: u32) {
         if y > 0 {
             out.extend_from_slice(b"\r\n");
         }
-        let dy = *DIACRITICS.get(y as usize).unwrap_or(&DIACRITICS[0]);
+        let dy = DIACRITICS[y as usize];
         for x in 0..cols {
-            let dx = *DIACRITICS.get(x as usize).unwrap_or(&DIACRITICS[0]);
+            let dx = DIACRITICS[x as usize];
             for ch in std::iter::once('\u{10EEEE}')
                 .chain(std::iter::once(dy))
                 .chain(std::iter::once(dx))
@@ -214,9 +219,17 @@ fn place(out: &mut Vec<u8>, cols: u32, rows: u32, id: u32) {
     out.extend_from_slice(b"\r\n");
 }
 
+/// Placeholder cells addressable per axis: a cell's row/column offset is
+/// encoded as one combining diacritic drawn from kitty's
+/// `rowcolumn-diacritics.txt` (297 entries, values 0..296), so no placeholder
+/// can express an offset past the table's end. `size::kitty_bounds` clamps
+/// the grid to this; emitting more cells would need an out-of-table mark.
+pub(crate) const MAX_PLACEHOLDER_CELLS: usize = DIACRITICS.len();
+
 /// Combining marks that vary each placeholder cell so the terminal does not
 /// merge adjacent private-use placeholder characters into a single glyph.
-/// Mirrors the DIACRITICS table from yazi's kgp driver.
+/// Mirrors the DIACRITICS table from yazi's kgp driver, which is kitty's
+/// `rowcolumn-diacritics.txt`.
 static DIACRITICS: [char; 297] = [
     '\u{0305}',
     '\u{030D}',
@@ -546,6 +559,30 @@ mod tests {
             let id = new_image_id();
             assert!(id < 0xffffff, "id {id} exceeds 24 bits");
         }
+    }
+
+    #[test]
+    fn wide_grid_never_exceeds_diacritics_table() {
+        // A 400-column grid of 10 px cells would need 400 column diacritics,
+        // but the table only holds 297 (kitty's rowcolumn-diacritics.txt).
+        // The bounds clamp must keep the grid within it; the old fallback to
+        // diacritic 0 rendered everything right of column 296 as garbage.
+        let mut o = opts();
+        o.win = crate::detect::WinSize {
+            cols: 400,
+            rows: 40,
+            px: None,
+        };
+        o.cell = crate::detect::CellPx { w: 10, h: 20 };
+        o.width = Some(3000);
+        // 3000x100 contains exactly to the clamped 2970x800 bounds:
+        // scale 0.99 -> 2970x99 -> 297 cols x ceil(99/20)=5 rows.
+        let img = image::DynamicImage::new_rgba8(3000, 100);
+        let out = render(&img, &o, 42);
+        let mut marker = [0u8; 4];
+        '\u{10EEEE}'.encode_utf8(&mut marker);
+        let placeholders = out.windows(4).filter(|w| *w == marker).count();
+        assert_eq!(placeholders, 297 * 5);
     }
 
     #[test]

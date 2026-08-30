@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use image::codecs::gif::GifDecoder;
 use image::metadata::{LoopCount, Orientation};
-use image::{AnimationDecoder, ColorType, DynamicImage, ImageDecoder, ImageReader};
+use image::{
+    AnimationDecoder, ColorType, DynamicImage, GenericImageView, ImageDecoder, ImageReader,
+};
 use jpeg_decoder::PixelFormat;
 
 use crate::meta;
@@ -447,6 +449,29 @@ fn decode_svg(buf: &[u8]) -> Result<DynamicImage, Box<dyn std::error::Error>> {
 pub enum Loaded {
     Static(DynamicImage),
     Gif(GifAnimation),
+}
+
+impl Loaded {
+    /// Pixel dimensions to size a preview from: the static image itself, or
+    /// the animated GIF's raw canvas from the file header — frames are
+    /// already resized to the shared preview target, so the header is the
+    /// only place the original dimensions survive.
+    pub fn dims(&self) -> (u32, u32) {
+        match self {
+            Loaded::Static(img) => img.dimensions(),
+            Loaded::Gif(anim) => gif_canvas(&anim.raw),
+        }
+    }
+}
+
+/// Logical screen size from a GIF header: little-endian u16 canvas width at
+/// offset 6 and height at offset 8, right after the 6-byte signature.
+fn gif_canvas(raw: &[u8]) -> (u32, u32) {
+    if raw.len() < 10 {
+        return (1, 1);
+    }
+    let le = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]) as u32;
+    (le(&raw[6..8]).max(1), le(&raw[8..10]).max(1))
 }
 
 pub fn load(

@@ -17,20 +17,61 @@ pub fn bitmap_bounds(o: &RenderOpts) -> (u64, u64) {
     )
 }
 
-/// Scaling bounds for the Kitty protocol, in DEVICE pixels: the physical
-/// cell times the grid. The placeholder grid derives from this same cell so
-/// `ceil(w/cell) <= cols`, and an ultra-wide image can never wrap its last
-/// placeholder column onto the next line.
+/// The grid kitty placeholders can address, in DEVICE pixels: a placeholder's
+/// row/column offset is one diacritic from a 297-entry table
+/// (`kitty::MAX_PLACEHOLDER_CELLS`), so both axes hard-cap there no matter
+/// how large the terminal is.
+pub fn kitty_grid_cap_px(o: &RenderOpts) -> (u64, u64) {
+    let (cw, ch) = kitty_cell(o);
+    let cap = crate::kitty::MAX_PLACEHOLDER_CELLS as u64;
+    (cap * cw as u64, cap * ch as u64)
+}
+
+/// Terminal-grid bounds for the Kitty protocol, in DEVICE pixels: the
+/// physical cell times the grid. The placeholder grid derives from this same
+/// cell so `ceil(w/cell) <= cols`, and an ultra-wide image can never wrap its
+/// last placeholder column onto the next line. No protocol cap applied (see
+/// `kitty_bounds`).
 ///
 /// The raw window-pixel report (`win.px`) is deliberately NOT used as a
 /// bound: on Ghostty it includes window padding, which can exceed the grid
 /// by a fraction of a cell.
-pub fn kitty_bounds(o: &RenderOpts) -> (u64, u64) {
+fn kitty_terminal_bounds(o: &RenderOpts) -> (u64, u64) {
     let (cw, ch) = kitty_cell(o);
     (
         (o.win.cols as u64 * cw as u64).max(1),
         (o.win.rows as u64 * ch as u64).max(1),
     )
+}
+
+/// Scaling bounds for the Kitty protocol, in DEVICE pixels: the terminal
+/// grid, clamped to `kitty::MAX_PLACEHOLDER_CELLS` per axis. A placeholder's
+/// row/column offset is one diacritic from a 297-entry table, so offsets past
+/// 296 cannot be expressed — a wider grid used to fall back to diacritic 0
+/// and garble everything right of row/column 296 (visible from `-w` ~2970 on
+/// a 10 px-cell terminal, and the same for heights past 297 cell rows).
+/// Images beyond the cap shrink to fit.
+pub fn kitty_bounds(o: &RenderOpts) -> (u64, u64) {
+    let cap = kitty_grid_cap_px(o);
+    let (w, h) = kitty_terminal_bounds(o);
+    (w.min(cap.0), h.min(cap.1))
+}
+
+/// One-line stderr notice for the kitty placeholder limit: `Some` when this
+/// image's preview had to shrink below what the terminal grid alone would
+/// allow — i.e. the 297-entry diacritics table, not the window, is the
+/// binding constraint. `img` is the RAW image size (for animations the GIF
+/// canvas, not the resized preview frames).
+pub fn kitty_protocol_clamp_notice(img: (u32, u32), o: &RenderOpts) -> Option<String> {
+    let uncapped = target_dims(img.0, img.1, o, kitty_terminal_bounds(o));
+    let capped = target_dims(img.0, img.1, o, kitty_bounds(o));
+    if uncapped == capped {
+        return None;
+    }
+    Some(format!(
+        "isee: limited to {}x{} px by the Kitty Graphics Protocol",
+        capped.0, capped.1,
+    ))
 }
 
 /// Physical cell size for the Kitty placeholder grid: max() of the probed
@@ -259,6 +300,89 @@ mod tests {
         // Ultra-wide image caps at 1440 wide -> exactly 80 placeholder cols.
         let (tw, _) = target_px(&img(3000, 1000), &o, kitty_bounds(&o));
         assert_eq!(tw.div_ceil(kitty_cell(&o).0), 80);
+    }
+
+    #[test]
+    fn kitty_bounds_clamped_to_addressable_grid() {
+        // A placeholder cell's row/column offset is a single diacritic from
+        // kitty's 297-entry rowcolumn-diacritics table, so grids beyond
+        // 297x297 cells cannot be addressed. 400 cols x 10 px cells would be
+        // 4000 px; the bounds must cap it at 2970 so `-w 3500` shrinks to
+        // fit instead of garbling everything right of column 296.
+        let mut o = opts();
+        o.cell = CellPx { w: 10, h: 20 };
+        o.win = WinSize {
+            cols: 400,
+            rows: 400,
+            px: None,
+        };
+        assert_eq!(kitty_bounds(&o), (2970, 5940));
+    }
+
+    #[test]
+    fn kitty_grid_cap_px_tracks_diacritics_table() {
+        let mut o = opts();
+        o.cell = CellPx { w: 10, h: 20 };
+        o.win = WinSize {
+            cols: 400,
+            rows: 400,
+            px: None,
+        };
+        assert_eq!(kitty_grid_cap_px(&o), (2970, 5940));
+    }
+
+    #[test]
+    fn clamp_notice_fires_for_wide_request() {
+        // -w 3500 on a 10 px-cell terminal: the protocol (2970 px), not the
+        // 400-col window (4000 px), is what shrinks the image.
+        let mut o = opts();
+        o.cell = CellPx { w: 10, h: 20 };
+        o.win = WinSize {
+            cols: 400,
+            rows: 400,
+            px: None,
+        };
+        o.width = Some(3500);
+        let msg = kitty_protocol_clamp_notice((3000, 100), &o).unwrap();
+        assert!(msg.contains("2970x98"), "{msg}");
+        assert!(msg.contains("Kitty Graphics Protocol"), "{msg}");
+    }
+
+    #[test]
+    fn clamp_notice_fires_for_tall_image() {
+        // A portrait image without -w: the 297-row cap (5940 px) binds
+        // before the 400-row window (8000 px).
+        let mut o = opts();
+        o.cell = CellPx { w: 10, h: 20 };
+        o.win = WinSize {
+            cols: 400,
+            rows: 400,
+            px: None,
+        };
+        let msg = kitty_protocol_clamp_notice((1500, 6000), &o).unwrap();
+        assert!(msg.contains("1485x5940"), "{msg}");
+        assert!(msg.contains("Kitty Graphics Protocol"), "{msg}");
+    }
+
+    #[test]
+    fn clamp_notice_silent_when_terminal_is_the_constraint() {
+        // A 200-col window (2000 px) is narrower than the 2970 px protocol
+        // cap: the same bounds apply either way, so no protocol notice.
+        let mut o = opts();
+        o.cell = CellPx { w: 10, h: 20 };
+        o.win = WinSize {
+            cols: 200,
+            rows: 400,
+            px: None,
+        };
+        o.width = Some(3500);
+        assert_eq!(kitty_protocol_clamp_notice((3000, 100), &o), None);
+    }
+
+    #[test]
+    fn clamp_notice_silent_within_grid() {
+        let o = opts();
+        assert_eq!(kitty_protocol_clamp_notice((100, 50), &o), None);
     }
 
     #[test]
