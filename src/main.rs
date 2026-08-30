@@ -289,7 +289,7 @@ fn preview_parallel(
     sources: &[input::Source],
     term: &detect::TerminalInfo,
     opts: &size::RenderOpts,
-    bounds: (u64, u64),
+    bounds: size::Bounds,
     animate: bool,
     out: &mut dyn Write,
 ) -> Result<(), AppErr> {

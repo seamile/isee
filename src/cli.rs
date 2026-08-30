@@ -45,8 +45,9 @@ If IMGPATH is omitted, image data is read from stdin.
 
 Options:
   -w WIDTH   Preview at the given pixel width.
-             Without -w, previews are capped at 1920 px wide. A preview is
-             never wider than the terminal window.
+             Without -w, the terminal window width is the only cap. A
+             preview is never wider than the terminal window; its height
+             may exceed the window (the terminal scrolls vertically).
   -q QUALITY Preview scaling quality: L (nearest), M (triangle), H (lanczos);
              default M
   -i         Show image information

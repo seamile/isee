@@ -126,7 +126,7 @@ fn decode_full(buf: &[u8]) -> Result<(DynamicImage, ColorType), Box<dyn std::err
 fn decode_for_preview(
     buf: &[u8],
     opts: &RenderOpts,
-    bounds: (u64, u64),
+    bounds: size::Bounds,
     dpy_scale: u32,
 ) -> Result<DynamicImage, Box<dyn std::error::Error>> {
     if is_svg(buf) {
@@ -153,7 +153,7 @@ fn shrink_to_points(
     img: DynamicImage,
     dpy_scale: u32,
     opts: &RenderOpts,
-    bounds: (u64, u64),
+    bounds: size::Bounds,
 ) -> DynamicImage {
     if dpy_scale <= 1 {
         return img;
@@ -183,7 +183,7 @@ fn is_gif(buf: &[u8]) -> bool {
 fn decode_jpeg_scaled(
     buf: &[u8],
     opts: &RenderOpts,
-    bounds: (u64, u64),
+    bounds: size::Bounds,
     dpy_scale: u32,
 ) -> Result<Option<DynamicImage>, Box<dyn std::error::Error>> {
     let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(buf));
@@ -477,7 +477,7 @@ fn gif_canvas(raw: &[u8]) -> (u32, u32) {
 pub fn load(
     source: &Source,
     opts: &RenderOpts,
-    bounds: (u64, u64),
+    bounds: size::Bounds,
     animate: bool,
 ) -> Result<Loaded, Box<dyn std::error::Error>> {
     let buf = read_all(source)?;
@@ -519,7 +519,7 @@ pub struct GifAnimation {
 fn decode_gif(
     buf: &[u8],
     opts: &RenderOpts,
-    bounds: (u64, u64),
+    bounds: size::Bounds,
     dpy_scale: u32,
 ) -> Result<GifAnimation, Box<dyn std::error::Error>> {
     // The GIF signature was verified by the caller (`is_gif`), so no format
@@ -753,7 +753,7 @@ mod tests {
         // below the source and above the target. The render resize then fits.
         let jpeg = encode_jpeg(1200, 600);
         let o = opts_width(Some(240));
-        let bounds = (100_000u64, 100_000u64);
+        let bounds = size::Bounds::window(100_000, 100_000);
         assert_eq!(size::target_dims(1200, 600, &o, bounds), (240, 120));
         let img = decode_jpeg_scaled(&jpeg, &o, bounds, 1)
             .unwrap()
@@ -767,7 +767,7 @@ mod tests {
     fn jpeg_gray_scaled_path() {
         let jpeg = encode_jpeg_gray(1200, 600);
         let o = opts_width(Some(240));
-        let bounds = (100_000u64, 100_000u64);
+        let bounds = size::Bounds::window(100_000, 100_000);
         let img = decode_jpeg_scaled(&jpeg, &o, bounds, 1)
             .unwrap()
             .expect("scaled");
@@ -780,7 +780,7 @@ mod tests {
         // A JPEG that already fits its target must not be sent through DCT.
         let jpeg = encode_jpeg(100, 50);
         let o = opts_width(None);
-        let bounds = (100_000u64, 100_000u64);
+        let bounds = size::Bounds::window(100_000, 100_000);
         assert!(decode_jpeg_scaled(&jpeg, &o, bounds, 1).unwrap().is_none());
     }
 
@@ -791,7 +791,7 @@ mod tests {
         // yielding 600x300, then rotated to a 300x600 portrait.
         let jpeg = with_exif_orientation(&encode_jpeg(1200, 600), 6);
         let o = opts_width(Some(240));
-        let bounds = (100_000u64, 100_000u64);
+        let bounds = size::Bounds::window(100_000, 100_000);
         assert_eq!(size::target_dims(600, 1200, &o, bounds), (240, 480));
         let img = decode_jpeg_scaled(&jpeg, &o, bounds, 1)
             .unwrap()
@@ -807,7 +807,7 @@ mod tests {
     #[test]
     fn decode_for_preview_scales_rgb_and_leaves_png_full() {
         let o = opts_width(Some(240));
-        let bounds = (100_000u64, 100_000u64);
+        let bounds = size::Bounds::window(100_000, 100_000);
         // JPEG goes through DCT scaling.
         let jpeg = encode_jpeg(1200, 600);
         let scaled = decode_for_preview(&jpeg, &o, bounds, 1).unwrap();
@@ -838,7 +838,7 @@ mod tests {
         // the natural imgcat-sized result, instead of the doubled 300pt.
         let png = encode_png(400, 300);
         let o = opts_width(None);
-        let bounds = (10_000u64, 10_000u64);
+        let bounds = size::Bounds::window(10_000, 10_000);
         let img = decode_for_preview(&png, &o, bounds, 2).unwrap();
         assert_eq!((img.width(), img.height()), (200, 150));
     }
@@ -847,7 +847,7 @@ mod tests {
     fn dpy_scale_one_keeps_native_size() {
         let png = encode_png(400, 300);
         let o = opts_width(None);
-        let bounds = (10_000u64, 10_000u64);
+        let bounds = size::Bounds::window(10_000, 10_000);
         let img = decode_for_preview(&png, &o, bounds, 1).unwrap();
         assert_eq!((img.width(), img.height()), (400, 300));
     }
@@ -863,7 +863,7 @@ mod tests {
             rows: 100,
             px: None,
         }; // point bounds 3600x1800 leave room for the upscale
-        let bounds = (3_600u64, 1_800u64);
+        let bounds = size::Bounds::window(3_600, 1_800);
         let img = decode_for_preview(&png, &o, bounds, 2).unwrap();
         assert_eq!((img.width(), img.height()), (800, 600));
     }
@@ -874,7 +874,7 @@ mod tests {
         // 100x50-point window shrinks further to fit (100x75).
         let png = encode_png(400, 300);
         let o = opts_width(None);
-        let bounds = (100u64, 50u64);
+        let bounds = size::Bounds::window(100, 50);
         let img = decode_for_preview(&png, &o, bounds, 2).unwrap();
         assert_eq!((img.width(), img.height()), (67, 50));
     }
@@ -885,7 +885,7 @@ mod tests {
         // at its point size (600x300), via DCT pre-scaling.
         let jpeg = encode_jpeg(1200, 600);
         let o = opts_width(None);
-        let bounds = (10_000u64, 10_000u64);
+        let bounds = size::Bounds::window(10_000, 10_000);
         let img = decode_for_preview(&jpeg, &o, bounds, 2).unwrap();
         assert_eq!((img.width(), img.height()), (600, 300));
     }
@@ -971,7 +971,7 @@ mod tests {
     fn jpeg_dct_scales_raw_source_over_dimension_limit() {
         let jpeg = encode_jpeg(12001, 60);
         let o = opts_width(Some(240));
-        let bounds = (100_000u64, 100_000u64);
+        let bounds = size::Bounds::window(100_000, 100_000);
         let img = decode_jpeg_scaled(&jpeg, &o, bounds, 1)
             .unwrap()
             .expect("DCT must scale an oversized JPEG");
@@ -1041,7 +1041,7 @@ mod tests {
         ];
         let buf = encode_gif(&frames, Repeat::Finite(2));
         let o = opts_width(None);
-        let bounds = (10_000u64, 10_000u64);
+        let bounds = size::Bounds::window(10_000, 10_000);
         let anim = decode_gif(&buf, &o, bounds, 1).unwrap();
         assert_eq!(anim.frames.len(), 3);
         let delays: Vec<u32> = anim.frames.iter().map(|f| f.delay_ms).collect();
@@ -1066,7 +1066,7 @@ mod tests {
         ];
         let buf = encode_gif(&frames, Repeat::Infinite);
         let o = opts_width(Some(20));
-        let bounds = (100_000u64, 100_000u64);
+        let bounds = size::Bounds::window(100_000, 100_000);
         let anim = decode_gif(&buf, &o, bounds, 1).unwrap();
         assert_eq!(anim.frames.len(), 2);
         for f in &anim.frames {
@@ -1078,7 +1078,7 @@ mod tests {
     fn decode_gif_with_single_frame_errors_for_static_fallback() {
         let buf = encode_gif(&[anim_frame(4, 4, [1, 2, 3], 5)], Repeat::Infinite);
         let o = opts_width(None);
-        let bounds = (10_000u64, 10_000u64);
+        let bounds = size::Bounds::window(10_000, 10_000);
         let Err(err) = decode_gif(&buf, &o, bounds, 1) else {
             panic!("expected an error for a single-frame GIF");
         };
@@ -1098,7 +1098,7 @@ mod tests {
         ];
         let buf = encode_gif(&frames, Repeat::Infinite);
         let o = opts_width(None);
-        let bounds = (10_000u64, 10_000u64);
+        let bounds = size::Bounds::window(10_000, 10_000);
         let anim = decode_gif(&buf, &o, bounds, 1).unwrap();
         for f in &anim.frames {
             assert_eq!(f.delay_ms, 1);
@@ -1115,7 +1115,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("isee_gif_{}.gif", std::process::id()));
         std::fs::write(&path, &buf).unwrap();
         let o = opts_width(None);
-        let bounds = (10_000u64, 10_000u64);
+        let bounds = size::Bounds::window(10_000, 10_000);
         let without_flag = load(&Source::Path(path.clone()), &o, bounds, false).unwrap();
         assert!(matches!(without_flag, Loaded::Static(_)));
         let with_flag = load(&Source::Path(path.clone()), &o, bounds, true).unwrap();

@@ -3,12 +3,12 @@
 A small utility for previewing images in the terminal.
 
 `isee` detects the terminal's image protocol at runtime and renders the image
-with the **Kitty graphics protocol** (with Unicode placeholder cells for
-precise sizing), **IIP** (iTerm2 OSC 1337 inline file: Warp, iTerm2, mintty,
-Tabby, and VSCode — the latter needs `terminal.integrated.enableImages: true`),
-or **Sixel** (Foot, Konsole, Windows Terminal,
-BlackBox). Terminals without graphics support fall back to **Half Blocks**
-(color-reduced character pairs).
+with the **Kitty graphics protocol** (direct bitmap placement outside tmux,
+Unicode placeholder cells inside tmux), **IIP** (iTerm2 OSC 1337 inline file:
+Warp, iTerm2, mintty, Tabby, and VSCode — the latter needs
+`terminal.integrated.enableImages: true`), or **Sixel** (Foot, Konsole,
+Windows Terminal, BlackBox). Terminals without graphics support fall back to
+**Half Blocks** (color-reduced character pairs).
 
 > **Platform support** — `isee` is currently built and tested on Linux and
 > macOS. Windows is not yet supported.
@@ -43,8 +43,11 @@ If `IMGPATH` is omitted, image data is read from `stdin`.
 - `-v`: Print the version
 - `-h, --help`: Print help
 
-Without `-w`, previews are capped at 1920px wide; a preview is never wider
-than the terminal window.
+Without `-w`, the terminal window width is the only width cap. A preview is
+never wider than the terminal window; with `-w` it may be TALLER than the
+window — graphics scroll with the text. Only the protocol's hard ceiling
+(the tmux kitty placeholder grid) and a 12000 px/side resource guard apply
+to height.
 
 ## Supported formats
 
@@ -93,8 +96,9 @@ cat /foo/bar/image.jpg | isee
 
 - **Scaling & HiDPI** — Bounds are derived from the physical grid cell (via
   `CSI 16 t` and the `TIOCGWINSZ` pixel size), accounting for Retina/HiDPI
-  devices-pixels. Without `-w`, the image is shown at its native pixel size and
-  only shrunk to fit the terminal; with `-w` it is scaled to that width.
+  devices-pixels. Without `-w`, the image is shown at its native pixel size
+  and shrunk to fit the terminal window; with `-w` it is scaled to that width
+  and may end up taller than the window (the terminal scrolls vertically).
 
 - **Bitmap display scale (IIP/Sixel on Retina)** — Bitmap bounds follow the
   terminal's *logical* grid (yazi's convention: one declared px = one
@@ -114,11 +118,16 @@ cat /foo/bar/image.jpg | isee
   `ISEE_DPI_SCALE=1` forces the default explicitly. On scaled displays `-w`
   counts in logical points for these protocols.
 
-- **Kitty rendering** — The image is uploaded as a sequence of 4096-byte chunked
-  APC frames. A grid of Unicode placeholder cells is then drawn at the exact
-  image size, giving crisp, correctly-positioned previews. Inside `tmux`, only
-  the APC transfer frames are wrapped in passthrough; the placeholder cells go
-  through the tmux grid so they land in the right pane and survive redraws.
+- **Kitty rendering** — Outside `tmux` the image is placed directly (`a=T`):
+  kitty draws the bitmap at its declared device-pixel size and graphics
+  scroll with the text, so an oversized height simply scrolls (only an
+  oversized width is truncated at the right edge). The payload travels as a
+  temp-file reference (`t=t`) when the terminal supports it, else as chunked
+  APC frames, zlib-compressed by default. Inside `tmux`, a grid of Unicode
+  placeholder cells is drawn instead (tmux's cursor model cannot track the
+  outer terminal's placement moves): only the APC transfer frames are
+  wrapped in passthrough; the placeholder cells go through the tmux grid so
+  they land in the right pane and survive redraws.
 
 - **IIP rendering** — Terminals speaking iTerm2's OSC 1337 inline-file protocol
   (Warp, iTerm2, mintty, Tabby, and VSCode with

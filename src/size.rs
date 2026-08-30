@@ -2,6 +2,36 @@ use image::{DynamicImage, GenericImageView};
 
 use crate::detect::{CellPx, WinSize};
 
+/// Scaling limits for one protocol, in protocol pixels (device px for KGP,
+/// logical px for IIP/Sixel, cell units for Half Blocks).
+///
+/// - `w` caps the preview width in every mode: the terminal window width,
+///   already including any protocol hard cap (tmux kitty diacritics grid).
+/// - `h` caps the height only when NO `-w` was given: without an explicit
+///   request the preview is kept inside the window, but the terminal scrolls
+///   vertically, so a `-w` preview may be taller than the window.
+/// - `h_cap` is the protocol's hard height ceiling for `-w` previews
+///   (tmux kitty placeholder grid; `u64::MAX` where scrolling is free),
+///   further clamped by `MAX_TARGET_DIMENSION` for resource safety.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Bounds {
+    pub w: u64,
+    pub h: u64,
+    pub h_cap: u64,
+}
+
+impl Bounds {
+    /// Window-derived bounds with no protocol height ceiling: `-w` previews
+    /// may tower over the window because the terminal scrolls with the text.
+    pub fn window(w: u64, h: u64) -> Bounds {
+        Bounds {
+            w,
+            h,
+            h_cap: u64::MAX,
+        }
+    }
+}
+
 /// Scaling bounds for bitmap protocols drawn by the terminal itself
 /// (Iip/Sixel), in LOGICAL pixels: the probed/logical cell times the grid.
 /// How a declared `Npx` size actually renders is brand-dependent (measured
@@ -10,8 +40,8 @@ use crate::detect::{CellPx, WinSize};
 /// follow yazi's logical-cell convention for both drivers, so they are
 /// exact on Warp and conservative (2x) on iTerm2, whose auto-fit still
 /// clamps the result. KGP instead maps an image pixel to a device pixel.
-pub fn bitmap_bounds(o: &RenderOpts) -> (u64, u64) {
-    (
+pub fn bitmap_bounds(o: &RenderOpts) -> Bounds {
+    Bounds::window(
         (o.win.cols as u64 * o.cell.w.max(1) as u64).max(1),
         (o.win.rows as u64 * o.cell.h.max(1) as u64).max(1),
     )
@@ -36,9 +66,9 @@ pub fn kitty_grid_cap_px(o: &RenderOpts) -> (u64, u64) {
 /// The raw window-pixel report (`win.px`) is deliberately NOT used as a
 /// bound: on Ghostty it includes window padding, which can exceed the grid
 /// by a fraction of a cell.
-fn kitty_terminal_bounds(o: &RenderOpts) -> (u64, u64) {
+fn kitty_terminal_bounds(o: &RenderOpts) -> Bounds {
     let (cw, ch) = kitty_cell(o);
-    (
+    Bounds::window(
         (o.win.cols as u64 * cw as u64).max(1),
         (o.win.rows as u64 * ch as u64).max(1),
     )
@@ -46,21 +76,26 @@ fn kitty_terminal_bounds(o: &RenderOpts) -> (u64, u64) {
 
 /// Scaling bounds for the Kitty protocol, in DEVICE pixels: the terminal
 /// grid. Direct placement (`a=T` without `C=1`) renders the bitmap at its
-/// declared device-pixel size and auto-fits oversize images, so the only
-/// bound is what the window can show. Inside tmux, though, rendering goes
+/// declared device-pixel size and graphics scroll with the text, so a `-w`
+/// preview's height is not window-bound. Inside tmux, though, rendering goes
 /// through the placeholder grid (tmux's cursor model cannot track the outer
 /// terminal's placement moves), and a placeholder cell's row/column offset is
 /// one diacritic from a 297-entry table — offsets past 296 cannot be
 /// expressed and fall back to diacritic 0, garbling everything right of
 /// row/column 296 (visible from `-w` ~2970 on a 10 px-cell terminal). So the
-/// tmux path clamps to the addressable grid; images beyond it shrink to fit.
-pub fn kitty_bounds(o: &RenderOpts) -> (u64, u64) {
-    let (w, h) = kitty_terminal_bounds(o);
+/// tmux path clamps both axes to the addressable grid; images beyond it
+/// shrink to fit.
+pub fn kitty_bounds(o: &RenderOpts) -> Bounds {
+    let b = kitty_terminal_bounds(o);
     if o.tmux {
         let cap = kitty_grid_cap_px(o);
-        (w.min(cap.0), h.min(cap.1))
+        Bounds {
+            w: b.w.min(cap.0),
+            h: b.h.min(cap.1),
+            h_cap: cap.1,
+        }
     } else {
-        (w, h)
+        b
     }
 }
 
@@ -98,8 +133,8 @@ pub fn kitty_cell(o: &RenderOpts) -> (u32, u32) {
 /// Scaling bounds for half-block rendering, in cell units (logical): the
 /// output is plain text, one character per cell column and two half-block
 /// pixel rows per cell row.
-pub fn halfblock_bounds(o: &RenderOpts) -> (u64, u64) {
-    (
+pub fn halfblock_bounds(o: &RenderOpts) -> Bounds {
+    Bounds::window(
         (o.win.cols as u64 * o.cell.w.max(1) as u64).max(1),
         (o.win.rows as u64 * o.cell.h.max(1) as u64 * 2).max(1),
     )
@@ -168,11 +203,14 @@ pub fn filter(quality: Quality) -> image::imageops::FilterType {
     }
 }
 
-/// Cap for previews without an explicit `-w`: wide images are downscaled to at
-/// most this pixel width (bounded in turn by the terminal window size).
-pub const DEFAULT_MAX_WIDTH: u64 = 1920;
+/// Resource-safety ceiling for any `-w` preview target, per side, in pixels.
+/// Decode-side guards (`input::PREVIEW_MAX_DIMENSION`) cannot police resize
+/// targets: an extreme-aspect source that decodes fine (e.g. 1x12000) would
+/// otherwise produce a `-w 2000` target of 2000x24,000,000 px (~192 GB of
+/// RGBA). `contain` keeps the aspect ratio, so the clamp stays proportional.
+pub const MAX_TARGET_DIMENSION: u64 = 12_000;
 
-pub fn target_px(img: &DynamicImage, o: &RenderOpts, bounds: (u64, u64)) -> (u32, u32) {
+pub fn target_px(img: &DynamicImage, o: &RenderOpts, bounds: Bounds) -> (u32, u32) {
     let (iw, ih) = img.dimensions();
     target_dims(iw, ih, o, bounds)
 }
@@ -181,21 +219,27 @@ pub fn target_px(img: &DynamicImage, o: &RenderOpts, bounds: (u64, u64)) -> (u32
 /// than a `DynamicImage`, so callers can drive scaling from an image header
 /// (plus EXIF orientation) before any full decode. `target_px` is a thin
 /// wrapper over this, so kitty/half-block rendering is unchanged.
-pub fn target_dims(iw: u32, ih: u32, o: &RenderOpts, bounds: (u64, u64)) -> (u32, u32) {
+pub fn target_dims(iw: u32, ih: u32, o: &RenderOpts, bounds: Bounds) -> (u32, u32) {
     let iw = iw.max(1) as u64;
     let ih = ih.max(1) as u64;
     let (tw, th) = match o.width {
-        Some(w) => contain(
-            w.max(1) as u64,
-            (ih * w.max(1) as u64 / iw).max(1),
-            bounds.0,
-            bounds.1,
-        ),
+        // Explicit width: scale proportionally and cap the width at the
+        // window (plus protocol hard caps). The height is NOT window-bound —
+        // the terminal scrolls vertically — only the protocol's hard ceiling
+        // (`bounds.h_cap`) and `MAX_TARGET_DIMENSION` apply.
+        Some(w) => {
+            let w = w.max(1) as u64;
+            contain(
+                w,
+                (ih * w / iw).max(1),
+                bounds.w,
+                bounds.h_cap.min(MAX_TARGET_DIMENSION),
+            )
+        }
         // No explicit width: display at the image's native pixel size (ignore
-        // DPI), capped at DEFAULT_MAX_WIDTH and then shrunk only as needed to
-        // fit the bounds. The window width always wins over any requested or
-        // default cap.
-        None => contain(iw, ih, bounds.0.min(DEFAULT_MAX_WIDTH), bounds.1),
+        // DPI), shrunk only as needed to fit the window. The window width
+        // always wins over any requested cap.
+        None => contain(iw, ih, bounds.w, bounds.h),
     };
     (tw as u32, th as u32)
 }
@@ -269,8 +313,10 @@ mod tests {
     fn width_request_capped_to_terminal() {
         let mut o = opts();
         o.width = Some(5000);
-        // max 720x432, image 100x100 -> uniform scale 432/5000 -> 432x432
-        assert_eq!(target_px(&img(100, 100), &o, kitty_bounds(&o)), (432, 432));
+        // max width 720, image 100x100 -> uniform scale 720/5000 -> 720x720;
+        // the height towers over the 432 px window because the terminal
+        // scrolls vertically.
+        assert_eq!(target_px(&img(100, 100), &o, kitty_bounds(&o)), (720, 720));
     }
 
     #[test]
@@ -306,7 +352,7 @@ mod tests {
         let mut o = opts();
         o.win.px = Some((1440, 864));
         assert_eq!(kitty_cell(&o), (18, 36));
-        assert_eq!(kitty_bounds(&o), (1440, 864));
+        assert_eq!((kitty_bounds(&o).w, kitty_bounds(&o).h), (1440, 864));
         // 982x548 now fits natively; a 2000x1000 image scales to 1440x720.
         assert_eq!(target_px(&img(982, 548), &o, kitty_bounds(&o)), (982, 548));
         assert_eq!(
@@ -324,7 +370,7 @@ mod tests {
         let mut o = opts();
         o.win.px = Some((1450, 870));
         assert_eq!(kitty_cell(&o), (18, 36));
-        assert_eq!(kitty_bounds(&o), (1440, 864));
+        assert_eq!((kitty_bounds(&o).w, kitty_bounds(&o).h), (1440, 864));
         // Ultra-wide image caps at 1440 wide -> exactly 80 placeholder cols.
         let (tw, _) = target_px(&img(3000, 1000), &o, kitty_bounds(&o));
         assert_eq!(tw.div_ceil(kitty_cell(&o).0), 80);
@@ -345,14 +391,14 @@ mod tests {
             rows: 400,
             px: None,
         };
-        assert_eq!(kitty_bounds(&o), (2970, 5940));
+        assert_eq!((kitty_bounds(&o).w, kitty_bounds(&o).h), (2970, 5940));
     }
 
     #[test]
     fn direct_placement_bounds_have_no_protocol_cap() {
         // Outside tmux the image is placed directly at its declared size and
-        // the terminal auto-fits oversize bitmaps, so a 400-col window stays
-        // 4000 px wide — no 297-cell clamp applies.
+        // graphics scroll with the text, so a 400-col x 400-row window stays
+        // 4000x8000 px — no 297-cell clamp applies.
         let mut o = opts();
         o.tmux = false;
         o.cell = CellPx { w: 10, h: 20 };
@@ -361,7 +407,9 @@ mod tests {
             rows: 400,
             px: None,
         };
-        assert_eq!(kitty_bounds(&o), (4000, 8000));
+        let b = kitty_bounds(&o);
+        assert_eq!((b.w, b.h), (4000, 8000));
+        assert_eq!(b.h_cap, u64::MAX);
     }
 
     #[test]
@@ -467,19 +515,19 @@ mod tests {
         // logical grid...
         let mut o = opts();
         assert_eq!(bitmap_bounds(&o), kitty_bounds(&o));
-        assert_eq!(bitmap_bounds(&o), (720, 432));
+        assert_eq!((bitmap_bounds(&o).w, bitmap_bounds(&o).h), (720, 432));
         // ...but on HiDPI only the KITTY bounds double: OSC 1337 and Sixel
         // render one image pixel per logical point, so their bounds must
         // stay at the logical cell (9x18), not the physical one (18x36).
         o.win.px = Some((1440, 864));
-        assert_eq!(kitty_bounds(&o), (1440, 864));
-        assert_eq!(bitmap_bounds(&o), (720, 432));
+        assert_eq!((kitty_bounds(&o).w, kitty_bounds(&o).h), (1440, 864));
+        assert_eq!((bitmap_bounds(&o).w, bitmap_bounds(&o).h), (720, 432));
     }
 
     #[test]
     fn halfblock_bounds_are_logical() {
         let o = opts();
-        assert_eq!(halfblock_bounds(&o), (720, 864));
+        assert_eq!((halfblock_bounds(&o).w, halfblock_bounds(&o).h), (720, 864));
     }
 
     #[test]
@@ -532,35 +580,94 @@ mod tests {
         // raw landscape grid.
         let mut o = opts();
         o.width = Some(720);
-        let b = (100_000u64, 100_000u64); // unbounded so width dominates
+        let b = Bounds::window(100_000, 100_000); // unbounded so width dominates
         let (tw, th) = target_dims(3000, 4000, &o, b); // oriented dims
         assert_eq!((tw, th), (720, 960)); // portrait aspect preserved
         assert_eq!(target_dims(4000, 3000, &o, b), (720, 540)); // landscape
     }
 
     #[test]
-    fn without_width_capped_at_default_max_width() {
-        // Even with a huge terminal, previews without -w never exceed 1920 px
-        // wide; smaller images keep their native size.
+    fn without_width_capped_to_window_only() {
+        // Without -w there is no default width cap any more: the window width
+        // is the only width limit; smaller images keep their native size.
         let o = opts();
-        let b = (100_000u64, 100_000u64);
-        assert_eq!(target_dims(4000, 2000, &o, b), (1920, 960));
+        let b = Bounds::window(100_000, 100_000);
+        assert_eq!(target_dims(5000, 3000, &o, b), (5000, 3000));
         assert_eq!(target_dims(1920, 1080, &o, b), (1920, 1080));
         assert_eq!(target_dims(800, 400, &o, b), (800, 400));
     }
 
     #[test]
-    fn default_width_cap_yields_to_window() {
-        // The window width always wins: min(window, 1920).
+    fn window_width_caps_previews_without_width_request() {
+        // The window width always wins, with or without an explicit -w.
         let mut o = opts(); // window bounds 720x432
         let b = kitty_bounds(&o);
         assert_eq!(target_dims(4000, 2000, &o, b), (720, 360));
-        // Explicit -w is also still capped by the window.
+        // Explicit -w is also still capped by the window (width only).
         o.width = Some(10_000);
         assert_eq!(target_dims(1000, 500, &o, b), (720, 360));
-        // ...and window height matters for tall images under the cap.
+        // ...and window height still matters for tall images without -w.
         o.width = None;
         assert_eq!(target_dims(1500, 4000, &o, b), (162, 432));
+    }
+
+    #[test]
+    fn width_request_ignores_window_height() {
+        // Non-tmux: a -w preview scales by width alone and may tower over the
+        // window because graphics scroll with the text.
+        let mut o = opts();
+        o.width = Some(800);
+        o.win = WinSize {
+            cols: 200,
+            rows: 50,
+            px: None,
+        }; // window 1800x900
+        assert_eq!(
+            target_px(&img(1000, 3000), &o, kitty_bounds(&o)),
+            (800, 2400)
+        );
+    }
+
+    #[test]
+    fn tmux_width_request_still_clamped_to_diacritics_rows() {
+        // Inside tmux the placeholder grid cannot address rows past the
+        // 297-entry diacritics table, so even a -w preview is clamped there
+        // (and stays proportional): 1000x12000 at -w 1000 -> 495x5940.
+        let mut o = opts();
+        o.tmux = true;
+        o.cell = CellPx { w: 10, h: 20 };
+        o.win = WinSize {
+            cols: 400,
+            rows: 400,
+            px: None,
+        };
+        o.width = Some(1000);
+        assert_eq!(target_dims(1000, 12_000, &o, kitty_bounds(&o)), (495, 5940));
+    }
+
+    #[test]
+    fn extreme_aspect_ratio_clamped_to_max_target_dimension() {
+        // A 1x12000 source decodes fine, but -w 2000 would naively target
+        // 2000x24,000,000 px (~192 GB of RGBA). MAX_TARGET_DIMENSION clamps
+        // the target to 12000 px tall, proportionally: 1x12000.
+        let mut o = opts();
+        o.width = Some(2000);
+        let b = Bounds::window(100_000, 100_000);
+        assert_eq!(target_dims(1, 12_000, &o, b), (1, 12_000));
+    }
+
+    #[test]
+    fn without_width_caps_to_window_width_not_1920() {
+        // No DEFAULT_MAX_WIDTH: a 5000-wide source in a 4000x8000 window is
+        // shrunk to the window width, not to the old 1920 px default.
+        let mut o = opts();
+        o.cell = CellPx { w: 10, h: 20 };
+        o.win = WinSize {
+            cols: 400,
+            rows: 400,
+            px: None,
+        };
+        assert_eq!(target_dims(5000, 3000, &o, kitty_bounds(&o)), (4000, 2400));
     }
 
     #[test]
