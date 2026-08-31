@@ -15,7 +15,15 @@ use crate::size::{self, RenderOpts};
 /// driver: Wu-based quantization to at most 256 colors (255 on alpha images,
 /// where palette entry 0 is reserved for fully transparent pixels), one
 /// band per 6 pixel rows with `$`/`-` cursor moves and `!`-run RLE.
-pub fn render(img: &DynamicImage, o: &RenderOpts) -> Vec<u8> {
+///
+/// `wezterm` is the WezTerm brand special-case: WezTerm advances the cursor to
+/// the image's last row itself while placing the bitmap
+/// (`assign_image_to_cells`), so only one CRLF is needed to park it one line
+/// below; every other sixel terminal (iTerm2, ...) leaves the cursor where it
+/// was and needs the full row count. Counting rows against the LOGICAL cell
+/// would reserve 2x the displayed height on a HiDPI screen, so we divide by
+/// the DEVICE cell height (`kitty_cell`).
+pub fn render(img: &DynamicImage, o: &RenderOpts, wezterm: bool) -> Vec<u8> {
     let (tw, th) = size::target_px(img, o, size::bitmap_bounds(o));
     let img = if tw == img.width() && th == img.height() {
         std::borrow::Cow::Borrowed(img)
@@ -91,12 +99,18 @@ pub fn render(img: &DynamicImage, o: &RenderOpts) -> Vec<u8> {
     }
     out.extend_from_slice(b"\x1b\\");
 
-    // Some terminals move below the image on their own; emitting one CRLF per
-    // LOGICAL cell row (same rule as Iip — Sixel pixels are rendered one per
-    // logical point) may add one blank line there, but is the only way to
-    // keep the prompt clear on the terminals that do not.
-    let ch = o.cell.h;
-    let rows = (h as f64 / ch.max(1) as f64).ceil().max(1.0) as u32;
+    // Park the cursor at the line below the image. WezTerm already moved the
+    // cursor to the image's last row during placement, so a single CRLF is
+    // enough there; other terminals need one CRLF per cell row the image
+    // actually spans. Sixel pixels are DEVICE pixels, so the row count must
+    // divide by the DEVICE cell height (`kitty_cell`) — the logical cell is
+    // half that on a HiDPI display, which would reserve 2x the height.
+    let rows = if wezterm {
+        1
+    } else {
+        let ch = size::kitty_cell(o).1.max(1) as f64;
+        (h as f64 / ch).ceil().max(1.0) as u32
+    };
     for _ in 0..rows {
         out.extend_from_slice(b"\r\n");
     }
@@ -147,7 +161,7 @@ mod tests {
     #[test]
     fn opaque_red_frame_structure() {
         let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 6, Rgb([255, 0, 0])));
-        let out = render(&img, &opts());
+        let out = render(&img, &opts(), false);
         let s = String::from_utf8_lossy(&out);
         assert!(s.starts_with("\x1bP9;1q\"1;1;1;6"), "got {s}");
         assert!(s.contains("#0;2;100;0;0"), "pure red must hit 100: {s}");
@@ -161,7 +175,7 @@ mod tests {
         let mut rgba = image::RgbaImage::new(2, 1);
         rgba.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
         rgba.put_pixel(1, 0, Rgba([0, 0, 255, 0]));
-        let out = render(&DynamicImage::ImageRgba8(rgba), &opts());
+        let out = render(&DynamicImage::ImageRgba8(rgba), &opts(), false);
         let s = String::from_utf8_lossy(&out);
         // Palette numbering starts at 1; #0 has no definition entry.
         assert!(s.contains("#1;2;"), "palette must start at #1: {s}");
@@ -171,7 +185,7 @@ mod tests {
     #[test]
     fn bands_split_every_six_rows() {
         let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 13, Rgb([10, 200, 30])));
-        let out = render(&img, &opts());
+        let out = render(&img, &opts(), false);
         let s = String::from_utf8_lossy(&out);
         assert!(s.matches('-').count() >= 2, "expected >=2 band breaks: {s}");
     }
@@ -179,7 +193,7 @@ mod tests {
     #[test]
     fn repeated_colors_rle_compressed() {
         let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(20, 1, Rgb([7, 7, 250])));
-        let out = render(&img, &opts());
+        let out = render(&img, &opts(), false);
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("!20"), "run of 20 must use an RLE marker: {s}");
     }
@@ -191,7 +205,7 @@ mod tests {
         rgba.put_pixel(1, 0, Rgba([50, 60, 70, 0]));
         rgba.put_pixel(2, 0, Rgba([50, 60, 70, 0]));
         rgba.put_pixel(3, 0, Rgba([50, 60, 70, 0]));
-        let out = render(&DynamicImage::ImageRgba8(rgba), &opts());
+        let out = render(&DynamicImage::ImageRgba8(rgba), &opts(), false);
         let s = String::from_utf8_lossy(&out);
         // All-transparent run maps to palette index 0 regardless of quantized
         // colors; row-0 plane char is '?' + (1 << 0) = '@'.
@@ -201,19 +215,31 @@ mod tests {
     #[test]
     fn trailing_newline_parks_cursor_below() {
         let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(3, 3, Rgb([1, 2, 3])));
-        let out = render(&img, &opts());
+        let out = render(&img, &opts(), false);
         assert!(out.ends_with(b"\r\n"));
-        // HiDPI: the row count must divide by the logical cell (10), not
-        // kitty_cell's doubled height (36) — a 20px image spans 2 rows.
+        // HiDPI: the row count must divide by the DEVICE cell (36), not the
+        // logical cell (10) — a 20px image spans ceil(20/36)=1 cell row, so a
+        // single CRLF parks it below; dividing by the logical cell would
+        // reserve 2x the height (ceil(20/10)=2).
         let mut o = opts();
         o.cell = CellPx { w: 5, h: 10 };
         o.win.px = Some((720, 864));
         let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 20, Rgb([1, 2, 3])));
-        let out = render(&img, &o);
+        let out = render(&img, &o, false);
         assert_eq!(
             String::from_utf8_lossy(&out).matches("\r\n").count(),
-            2,
-            "2 logical cell rows expected"
+            1,
+            "1 device cell row expected"
+        );
+        // WezTerm advances the cursor to the image's last row itself, so only
+        // one CRLF is emitted regardless of the image height.
+        let o = opts();
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 120, Rgb([1, 2, 3])));
+        let out = render(&img, &o, true);
+        assert_eq!(
+            String::from_utf8_lossy(&out).matches("\r\n").count(),
+            1,
+            "WezTerm emits a single CRLF"
         );
     }
 }

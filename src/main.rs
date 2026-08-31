@@ -279,10 +279,17 @@ fn render_block(
     let block = match term.protocol {
         Protocol::Kitty => kitty::render(img, opts, kitty::new_image_id()),
         Protocol::Iip => iip::render(img, opts),
-        Protocol::Sixel => sixel::render(img, opts),
+        Protocol::Sixel => sixel::render(img, opts, is_wezterm(term)),
         Protocol::HalfBlocks => halfblock::render(img, opts).into_bytes(),
     };
     wrap_tmux(block, term)
+}
+
+/// Whether the terminal is WezTerm. WezTerm advances the cursor to the last
+/// image row while placing a Sixel, so it needs only one trailing CRLF (see
+/// `sixel::render`); it is recognized from env vars or the XTVERSION probe.
+fn is_wezterm(term: &detect::TerminalInfo) -> bool {
+    term.brand == Some(brand::Brand::WezTerm)
 }
 
 /// Worker count for multi-file previews. Each worker holds at most one
