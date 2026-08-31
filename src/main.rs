@@ -279,17 +279,25 @@ fn render_block(
     let block = match term.protocol {
         Protocol::Kitty => kitty::render(img, opts, kitty::new_image_id()),
         Protocol::Iip => iip::render(img, opts),
-        Protocol::Sixel => sixel::render(img, opts, is_wezterm(term)),
+        Protocol::Sixel => sixel::render(img, opts, sixel_advances_cursor(term)),
         Protocol::HalfBlocks => halfblock::render(img, opts).into_bytes(),
     };
     wrap_tmux(block, term)
 }
 
-/// Whether the terminal is WezTerm. WezTerm advances the cursor to the last
-/// image row while placing a Sixel, so it needs only one trailing CRLF (see
-/// `sixel::render`); it is recognized from env vars or the XTVERSION probe.
-fn is_wezterm(term: &detect::TerminalInfo) -> bool {
-    term.brand == Some(brand::Brand::WezTerm)
+/// Whether the terminal advances the cursor past the image on its own while
+/// placing a Sixel, so only one trailing CRLF is needed to park the prompt
+/// one line below. WezTerm does this (verified from its `assign_image_to_cells`
+/// source: the cursor ends at the image's last row), and iTerm2 + VSCode
+/// measured the same class of behavior (a bare CRLF-per-device-cell count
+/// leaves 2x the displayed height of blank rows, i.e. the terminal already
+/// moved the cursor and isee's rows stack on top). Recognized from env vars
+/// or the XTVERSION probe.
+fn sixel_advances_cursor(term: &detect::TerminalInfo) -> bool {
+    matches!(
+        term.brand,
+        Some(brand::Brand::WezTerm) | Some(brand::Brand::Iterm2) | Some(brand::Brand::Vscode)
+    )
 }
 
 /// Worker count for multi-file previews. Each worker holds at most one
@@ -720,6 +728,29 @@ mod tests {
                 !osc_payload_is_gif(&render_loaded(&gif_loaded(), &term, &o)),
                 "{brand:?} must fall back to the first frame"
             );
+        }
+    }
+
+    #[test]
+    fn sixel_advance_brands_are_whitelisted() {
+        // WezTerm/iTerm2/VSCode move the cursor past a placed Sixel
+        // automatically; every other brand must use the full row count.
+        for brand in [
+            Some(brand::Brand::WezTerm),
+            Some(brand::Brand::Iterm2),
+            Some(brand::Brand::Vscode),
+        ] {
+            let term = term_of(Protocol::Sixel, brand, false);
+            assert!(sixel_advances_cursor(&term), "{brand:?} advances");
+        }
+        for brand in [
+            Some(brand::Brand::KittyFamily),
+            Some(brand::Brand::Foot),
+            Some(brand::Brand::Tabby),
+            None,
+        ] {
+            let term = term_of(Protocol::Sixel, brand, false);
+            assert!(!sixel_advances_cursor(&term), "{brand:?} does not advance");
         }
     }
 

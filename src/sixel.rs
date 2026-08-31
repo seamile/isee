@@ -16,14 +16,16 @@ use crate::size::{self, RenderOpts};
 /// where palette entry 0 is reserved for fully transparent pixels), one
 /// band per 6 pixel rows with `$`/`-` cursor moves and `!`-run RLE.
 ///
-/// `wezterm` is the WezTerm brand special-case: WezTerm advances the cursor to
-/// the image's last row itself while placing the bitmap
-/// (`assign_image_to_cells`), so only one CRLF is needed to park it one line
-/// below; every other sixel terminal (iTerm2, ...) leaves the cursor where it
-/// was and needs the full row count. Counting rows against the LOGICAL cell
-/// would reserve 2x the displayed height on a HiDPI screen, so we divide by
-/// the DEVICE cell height (`kitty_cell`).
-pub fn render(img: &DynamicImage, o: &RenderOpts, wezterm: bool) -> Vec<u8> {
+/// `advances` is the brand special-case for terminals that move the cursor
+/// past the image themselves while placing the bitmap (WezTerm's
+/// `assign_image_to_cells` does this — the cursor ends on the image's last
+/// row; iTerm2 and VSCode behave the same class of way): only one CRLF is
+/// needed there to park the prompt one line below, whereas other sixel
+/// terminals leave the cursor wherever it was and need one CRLF per cell row.
+/// Counting rows against the LOGICAL cell would reserve 2x the displayed
+/// height on a HiDPI screen, so the full-row path divides by the DEVICE cell
+/// height (`kitty_cell`).
+pub fn render(img: &DynamicImage, o: &RenderOpts, advances: bool) -> Vec<u8> {
     let (tw, th) = size::target_px(img, o, size::bitmap_bounds(o));
     let img = if tw == img.width() && th == img.height() {
         std::borrow::Cow::Borrowed(img)
@@ -99,13 +101,14 @@ pub fn render(img: &DynamicImage, o: &RenderOpts, wezterm: bool) -> Vec<u8> {
     }
     out.extend_from_slice(b"\x1b\\");
 
-    // Park the cursor at the line below the image. WezTerm already moved the
-    // cursor to the image's last row during placement, so a single CRLF is
-    // enough there; other terminals need one CRLF per cell row the image
-    // actually spans. Sixel pixels are DEVICE pixels, so the row count must
-    // divide by the DEVICE cell height (`kitty_cell`) — the logical cell is
-    // half that on a HiDPI display, which would reserve 2x the height.
-    let rows = if wezterm {
+    // Park the cursor at the line below the image. Terminals in the
+    // `advances` set (WezTerm, iTerm2, VSCode) already moved the cursor past
+    // the image during placement, so a single CRLF is enough; other terminals
+    // need one CRLF per cell row the image actually spans. Sixel pixels are
+    // DEVICE pixels, so the row count must divide by the DEVICE cell height
+    // (`kitty_cell`) — the logical cell is half that on a HiDPI display,
+    // which would reserve 2x the height.
+    let rows = if advances {
         1
     } else {
         let ch = size::kitty_cell(o).1.max(1) as f64;
@@ -231,15 +234,16 @@ mod tests {
             1,
             "1 device cell row expected"
         );
-        // WezTerm advances the cursor to the image's last row itself, so only
-        // one CRLF is emitted regardless of the image height.
+        // Advances-brand terminals (WezTerm, iTerm2, VSCode) move the cursor
+        // past the image themselves, so only one CRLF is emitted regardless
+        // of the image height.
         let o = opts();
         let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 120, Rgb([1, 2, 3])));
         let out = render(&img, &o, true);
         assert_eq!(
             String::from_utf8_lossy(&out).matches("\r\n").count(),
             1,
-            "WezTerm emits a single CRLF"
+            "advances terminals emit a single CRLF"
         );
     }
 }
