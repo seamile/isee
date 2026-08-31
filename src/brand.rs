@@ -81,6 +81,29 @@ pub fn detect(lookup: impl Fn(&str) -> Option<String>) -> Option<Brand> {
         .map(|(_, brand)| brand)
 }
 
+/// Recognize the terminal brand from an XTVERSION response body (`DCS > |
+/// name ST`, e.g. `kitty(0.42.2)` or `WezTerm 20240203-110809-5046fc22`),
+/// mirroring yazi's `Brand::from_csi` substring table. Multiplexer names
+/// (tmux/Zellij/libvterm) deliberately map to None: they name no bitmap
+/// terminal, and the env table keeps covering those.
+pub fn from_version_str(resp: &str) -> Option<Brand> {
+    let names = [
+        ("kitty", Brand::KittyFamily),
+        ("Konsole", Brand::Konsole),
+        ("iTerm2", Brand::Iterm2),
+        ("WezTerm", Brand::WezTerm),
+        ("foot", Brand::Foot),
+        ("ghostty", Brand::Ghostty),
+        ("Warp", Brand::Warp),
+        ("Rio ", Brand::Rio),
+        ("Bobcat", Brand::Bobcat),
+    ];
+    names
+        .into_iter()
+        .find(|&(n, _)| resp.contains(n))
+        .map(|(_, b)| b)
+}
+
 /// The preferred bitmap protocol for a brand, following yazi's driver table
 /// minus drivers this tool does not implement:
 /// - Iip is the first pick for iTerm2/Warp/mintty/VSCode/Tabby/Bobcat
@@ -178,6 +201,32 @@ mod tests {
         assert_eq!(detect(e), None);
         let e = env_of(&[]);
         assert_eq!(detect(e), None);
+    }
+
+    #[test]
+    fn version_str_recognizes_graphic_terminals() {
+        assert_eq!(from_version_str("kitty(0.42.2)"), Some(Brand::KittyFamily));
+        assert_eq!(from_version_str("Konsole 24.08.1"), Some(Brand::Konsole));
+        assert_eq!(from_version_str("iTerm2 3.5.12"), Some(Brand::Iterm2));
+        assert_eq!(
+            from_version_str("WezTerm 20240203-110809-5046fc22"),
+            Some(Brand::WezTerm)
+        );
+        assert_eq!(from_version_str("foot(version 1.20)"), Some(Brand::Foot));
+        assert_eq!(from_version_str("ghostty 1.1.0"), Some(Brand::Ghostty));
+        assert_eq!(from_version_str("Warp 0.2026.01"), Some(Brand::Warp));
+        assert_eq!(from_version_str("Rio 0.2.17"), Some(Brand::Rio));
+        assert_eq!(from_version_str("Bobcat 1.2"), Some(Brand::Bobcat));
+    }
+
+    #[test]
+    fn version_str_rejects_multiplexers_and_unknown() {
+        // Multiplexers name no bitmap terminal; keep the env table's verdict.
+        assert_eq!(from_version_str("tmux 3.4"), None);
+        assert_eq!(from_version_str("Zellij 0.41"), None);
+        assert_eq!(from_version_str("libvterm 0.3"), None);
+        assert_eq!(from_version_str("xterm(370)"), None);
+        assert_eq!(from_version_str(""), None);
     }
 
     #[test]

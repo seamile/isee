@@ -37,6 +37,9 @@ If `IMGPATH` is omitted, image data is read from `stdin`.
 - `-w WIDTH`: Preview at the given pixel width (e.g. `-w 800` for 800px)
 - `-q QUALITY`: Preview scaling quality: `L` (nearest, fastest), `M`
   (triangle, default), `H` (lanczos, sharpest)
+- `-p PROTOCOL`: Force the preview protocol: `auto` (default), `kitty`,
+  `iip`, `sixel`, or `halfblock` — for terminals whose environment does not
+  identify them (e.g. over ssh)
 - `-i`: Show image information (size, dimensions, DPI, colorspace, alpha)
 - `-a`: Animate GIFs and animated WebPs where the terminal supports it
   (kitty; iTerm2/mintty for GIFs), else fall back to the first frame
@@ -81,19 +84,30 @@ isee -i /foo/bar/image.jpg
 isee -a /foo/bar/animation.gif
 isee -a /foo/bar/animation.webp
 
+# Force a protocol when detection cannot identify the terminal (e.g. ssh)
+isee -p sixel /foo/bar/image.jpg
+isee -pkitty /foo/bar/image.jpg
+
 # Read image data from a pipe
 cat /foo/bar/image.jpg | isee
 ```
 
 ## How it works
 
-- **Protocol detection** — `isee` probes the running terminal with the Kitty
-  graphics query (`\x1b_G...` payload) and reads the cell-size query (`CSI 16 t`).
-  When inside `tmux`, queries are wrapped in tmux's DCS passthrough
-  (`\x1bPtmux;\x1b...\x1b\\`) so the *outer* terminal is probed, mirroring how
-  yazi works. Detection is gated on environment signals (`TERM`, `TERM_PROGRAM`,
-  `KITTY_WINDOW_ID`, `GHOSTTY_RESOURCES_DIR`, `WEZTERM_EXECUTABLE`) so the probe
-  sequence is never emitted to a terminal that cannot consume it.
+- **Protocol detection** — On any tty `isee` sends ONE probe batch, wrapped
+  between cursor save/restore and ending with an erase-line that scrubs any
+  leaked payload echo. The batch asks the terminal to identify itself
+  (XTVERSION) and report its capabilities (DA1; attribute 4 = sixel), plus
+  the Kitty graphics query (`\x1b_G...` payload) when the kitty protocol is
+  still a candidate. All answers share one deadline. Inside `tmux`, the batch
+  is wrapped in tmux's DCS passthrough (`\x1bPtmux;\x1b...\x1b\\`) so the
+  *outer* terminal is probed, mirroring how yazi works. The environment brand
+  table (`TERM`, `TERM_PROGRAM`, `KITTY_WINDOW_ID`,
+  `GHOSTTY_RESOURCES_DIR`, `WEZTERM_EXECUTABLE`, ...) still runs first; an
+  XTVERSION self-report overrides it, so terminals whose env vars do not
+  survive ssh are still identified. Selection priority: `-p` >
+  `ISEE_PROTOCOL` > probed Kitty / kitty env hint > brand table (env or
+  XTVERSION) > probed sixel (DA1) > Half Blocks.
 
 - **Scaling & HiDPI** — Bounds are derived from the physical grid cell (via
   `CSI 16 t` and the `TIOCGWINSZ` pixel size), accounting for Retina/HiDPI
@@ -142,9 +156,9 @@ cat /foo/bar/image.jpg | isee
 
 - **Sixel rendering** — Sixel terminals (Foot, Konsole, Windows Terminal,
   BlackBox) get a Wu-quantized (256-color) sixel bitmap sized with the same
-  point-space scale. Inside `tmux`, nested
-  DCS escaping is unreliable, so Sixel degrades to Half Blocks there; force it
-  with `ISEE_PROTOCOL=sixel` if you know your setup works.
+  point-space scale. Inside `tmux`, nested DCS escaping is unreliable, so
+  Sixel degrades to Half Blocks there — unless forced with `-p sixel`, which
+  rides the DCS passthrough wrapper instead.
 
 - **Animation (`-a`)** — Animated GIFs and animated WebPs play on kitty via
   the native graphics animation protocol (composited full-canvas frames
@@ -159,7 +173,8 @@ cat /foo/bar/image.jpg | isee
 
 - **Half Blocks fallback** — Terminals without graphics support get a downscaled,
   color-reduced character-pair rendering. `ISEE_PROTOCOL=half|kitty|iip|sixel`
-  overrides detection (`half` is the universal escape hatch).
+  overrides detection (`half` is the universal escape hatch); `-p` accepts the
+  same values (see Options).
 
 ## Acknowledgements
 

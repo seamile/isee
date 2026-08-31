@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::detect::Protocol;
 use crate::size::Quality;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -9,6 +10,7 @@ pub struct Args {
     pub quality: Quality,
     pub info: bool,
     pub animate: bool,
+    pub protocol: Option<Protocol>,
     pub paths: Vec<PathBuf>,
 }
 
@@ -19,6 +21,7 @@ pub enum ParseError {
     MissingValue(&'static str),
     InvalidNumber(&'static str, String),
     InvalidQuality(String),
+    InvalidProtocol(String),
     UnknownOption(String),
 }
 
@@ -32,6 +35,10 @@ impl fmt::Display for ParseError {
             ParseError::InvalidQuality(v) => {
                 write!(f, "invalid quality {v:?}: expected L, M or H")
             }
+            ParseError::InvalidProtocol(v) => write!(
+                f,
+                "invalid protocol {v:?}: expected auto, kitty, iip, sixel or halfblock"
+            ),
             ParseError::UnknownOption(o) => write!(f, "unknown option {o}"),
         }
     }
@@ -50,6 +57,8 @@ Options:
              may exceed the window (the terminal scrolls vertically).
   -q QUALITY Preview scaling quality: L (nearest), M (triangle), H (lanczos);
              default M
+  -p PROTO   Force the preview protocol: auto (default), kitty, iip,
+             sixel or halfblock
   -i         Show image information
   -a         Animate GIFs where the terminal supports it (kitty; iTerm2,
              mintty), else fall back to the first frame
@@ -73,6 +82,10 @@ where
             out.quality = parse_quality(v)?;
             continue;
         }
+        if let Some(v) = short_value("-p", &arg) {
+            out.protocol = parse_protocol(v)?;
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => return Err(ParseError::Help),
             "-v" => return Err(ParseError::Version),
@@ -85,6 +98,10 @@ where
             "-q" => {
                 let v = it.next().ok_or(ParseError::MissingValue("-q"))?;
                 out.quality = parse_quality(&v)?;
+            }
+            "-p" => {
+                let v = it.next().ok_or(ParseError::MissingValue("-p"))?;
+                out.protocol = parse_protocol(&v)?;
             }
             s if s.starts_with('-') && s.len() > 1 => {
                 return Err(ParseError::UnknownOption(s.to_string()));
@@ -108,6 +125,19 @@ fn parse_num(opt: &'static str, v: &str) -> Result<u32, ParseError> {
 
 fn parse_quality(v: &str) -> Result<Quality, ParseError> {
     Quality::parse(v).ok_or_else(|| ParseError::InvalidQuality(v.trim().to_string()))
+}
+
+/// `-p` protocol choice: `auto` maps to None (let detection decide), the
+/// rest force a concrete protocol; anything else is a hard usage error.
+fn parse_protocol(v: &str) -> Result<Option<Protocol>, ParseError> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(None),
+        "kitty" => Ok(Some(Protocol::Kitty)),
+        "iip" => Ok(Some(Protocol::Iip)),
+        "sixel" => Ok(Some(Protocol::Sixel)),
+        "halfblock" | "halfblocks" => Ok(Some(Protocol::HalfBlocks)),
+        _ => Err(ParseError::InvalidProtocol(v.trim().to_string())),
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +230,36 @@ mod tests {
     fn parse_defaults_to_medium_quality() {
         let a = parse(std::iter::empty::<&str>()).unwrap();
         assert_eq!(a.quality, Quality::Medium);
+        assert_eq!(a.protocol, None);
+    }
+
+    #[test]
+    fn parse_protocol_values() {
+        assert_eq!(parse(["-p", "auto"]).unwrap().protocol, None);
+        assert_eq!(parse(["-pkitty"]).unwrap().protocol, Some(Protocol::Kitty));
+        assert_eq!(parse(["-p", "IIP"]).unwrap().protocol, Some(Protocol::Iip));
+        assert_eq!(parse(["-psixel"]).unwrap().protocol, Some(Protocol::Sixel));
+        assert_eq!(
+            parse(["-p", "halfblock"]).unwrap().protocol,
+            Some(Protocol::HalfBlocks)
+        );
+        assert_eq!(
+            parse(["-p", "halfblocks"]).unwrap().protocol,
+            Some(Protocol::HalfBlocks)
+        );
+    }
+
+    #[test]
+    fn parse_protocol_rejects_unknown_values() {
+        assert!(matches!(
+            parse(["-p", "asciart"]),
+            Err(ParseError::InvalidProtocol(v)) if v == "asciart"
+        ));
+        assert!(matches!(
+            parse(["-p", ""]),
+            Err(ParseError::InvalidProtocol(..))
+        ));
+        assert!(matches!(parse(["-p"]), Err(ParseError::MissingValue("-p"))));
     }
 
     #[test]

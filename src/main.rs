@@ -136,7 +136,7 @@ fn run_preview(
     stdout: &io::Stdout,
 ) -> Result<(), AppErr> {
     let multi = sources.len() > 1;
-    let term = detect::detect(stdout.as_raw_fd());
+    let term = detect::detect(stdout.as_raw_fd(), args.protocol);
     let opts = size::RenderOpts {
         width: args.width,
         quality: args.quality,
@@ -205,11 +205,18 @@ fn note_protocol_clamp(
     }
 }
 
-/// Tmux passthrough for graphics escapes. Sixel is downgraded to Half Blocks
-/// at detect() time (nested DCS escaping does not survive tmux), so only
-/// Kitty APC chunks and Iip OSC frames get the passthrough treatment.
+/// Tmux passthrough for graphics escapes: wrap each transfer frame in its
+/// own DCS passthrough while plain text and SGR colours flow through the
+/// pane grid. Kitty APC chunks and Iip OSC frames always ride it; Sixel DCS
+/// frames only when the user forced `-p sixel` (detection downgrades
+/// unforced sixel to Half Blocks inside tmux).
 fn wrap_tmux(block: Vec<u8>, term: &detect::TerminalInfo) -> Vec<u8> {
-    if term.tmux && matches!(term.protocol, Protocol::Kitty | Protocol::Iip) {
+    if term.tmux
+        && matches!(
+            term.protocol,
+            Protocol::Kitty | Protocol::Iip | Protocol::Sixel
+        )
+    {
         detect::wrap_graphics_passthrough(&block)
     } else {
         block
