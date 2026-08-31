@@ -90,9 +90,11 @@ pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
         }
         // KGP queries leak their APC payload as visible text on
         // unsupporting terminals, so they only run when the kitty protocol
-        // is a candidate (auto or forced kitty); the batch's trailing
-        // EraseLine scrubs whatever echo still made it through.
-        let want_kgp = forced.is_none() || forced == Some(Protocol::Kitty);
+        // still needs evidence: forced kitty (the probe confirms tempfile
+        // transport), or auto with no brand-table default (its measured
+        // matrix already carries the verdict; skipping saves the scan).
+        let want_kgp = forced == Some(Protocol::Kitty)
+            || (forced.is_none() && brand.and_then(crate::brand::preferred_protocol).is_none());
         let answers = probe_batch(&mut tty, tmux, want_kgp);
         if let Some(b) = answers.brand {
             brand = Some(b);
@@ -148,8 +150,20 @@ pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
     // point size before encoding; that reaches the QuickLook intent on Warp
     // but halves it again on iTerm2 (there, `-w 2x` means QuickLook size).
     let dpy_scale = isee_dpi_scale().unwrap_or(1);
+    // Brand-table selection skips the KGP probe for recognized terminals, so
+    // its tempfile verdict is missing for the native KGP brands (kitty,
+    // Ghostty, WezTerm — all three transport temp files by protocol design);
+    // default them to tempfile so the skipped probe does not silently cost
+    // the direct-placement speedup. `ISEE_KGP_TRANSFER=stream` still opts
+    // out, and iTerm2/VSCode/Warp keep the conservative stream default.
+    let brand_kgp = matches!(
+        brand,
+        Some(crate::brand::Brand::KittyFamily)
+            | Some(crate::brand::Brand::Ghostty)
+            | Some(crate::brand::Brand::WezTerm)
+    );
     let kgp_transfer = kgp_transfer_choice(
-        probed_kitty && probed_file,
+        (probed_kitty && probed_file) || brand_kgp,
         env::var("ISEE_KGP_TRANSFER").ok().as_deref(),
     );
 
@@ -181,10 +195,13 @@ pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
     info
 }
 
-/// Protocol priority: `-p` > `ISEE_PROTOCOL` > probed KGP / kitty env hint >
-/// brand table (env- or XTVERSION-derived) > probed DA1 sixel > Half Blocks.
-/// Sixel inside tmux is downgraded to Half Blocks unless it was forced with
-/// `-p sixel` — forced sixel rides the DCS passthrough wrapper instead.
+/// Protocol priority: `-p` > `ISEE_PROTOCOL` > brand table (env- or
+/// XTVERSION-derived; measured support matrix, KGP-first) > probed KGP /
+/// kitty env hint > probed DA1 sixel > Half Blocks. The brand table wins over
+/// probing so recognized terminals skip the KGP query in detect()
+/// (`want_kgp`); unknown brands still ride the probe. Sixel inside tmux is
+/// downgraded to Half Blocks unless it was forced with `-p sixel` — forced
+/// sixel rides the DCS passthrough wrapper instead.
 fn select_protocol(
     forced: Option<Protocol>,
     override_p: Option<Protocol>,
@@ -198,9 +215,9 @@ fn select_protocol(
         Some(p) => p,
         None => match override_p {
             Some(p) => p,
-            None if probed_kitty || env_kitty => Protocol::Kitty,
             None => brand
                 .and_then(crate::brand::preferred_protocol)
+                .or_else(|| (probed_kitty || env_kitty).then_some(Protocol::Kitty))
                 .or_else(|| probed_sixel.then_some(Protocol::Sixel))
                 .unwrap_or(Protocol::HalfBlocks),
         },
@@ -1179,25 +1196,31 @@ mod tests {
     }
 
     #[test]
-    fn select_protocol_probes_and_brand_priority() {
-        // Probed KGP beats the brand table and the kitty env hint is kept
-        // even without a successful KGP probe.
+    fn select_protocol_brand_beats_probes_and_kitty_hint_kept() {
+        // Brand table (measured matrix) beats probed KGP and probed DA1
+        // sixel: Warp/Foot would otherwise flip to the probed protocol.
         assert_eq!(
-            select_protocol(None, None, true, false, Some(Brand::Foot), true, false),
+            select_protocol(None, None, true, false, Some(Brand::Warp), true, false),
             Protocol::Kitty
         );
+        assert_eq!(
+            select_protocol(None, None, true, false, Some(Brand::Foot), true, false),
+            Protocol::Sixel
+        );
+        // KGP brand with no probe result at all (probe skipped) still Kitty.
+        assert_eq!(
+            select_protocol(None, None, false, false, Some(Brand::Iterm2), false, false),
+            Protocol::Kitty
+        );
+        // Hyper: no bitmap protocol at all.
+        assert_eq!(
+            select_protocol(None, None, false, false, Some(Brand::Hyper), false, false),
+            Protocol::HalfBlocks
+        );
+        // Without a brand, the kitty env hint is kept even without a probe.
         assert_eq!(
             select_protocol(None, None, false, true, None, false, false),
             Protocol::Kitty
-        );
-        // Brand table (env or XTVERSION-derived) beats probed DA1 sixel.
-        assert_eq!(
-            select_protocol(None, None, false, false, Some(Brand::Warp), true, false),
-            Protocol::Iip
-        );
-        assert_eq!(
-            select_protocol(None, None, false, false, Some(Brand::Foot), true, false),
-            Protocol::Sixel
         );
         // DA1 sixel without any brand.
         assert_eq!(
