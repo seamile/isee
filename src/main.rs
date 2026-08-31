@@ -54,6 +54,46 @@ enum AppErr {
     Fatal(String),
 }
 
+/// Exit-time repair for interrupted graphics output, chafa's `fast_exit`
+/// re-worked in Rust. A graphics frame is one long escape sequence (kitty
+/// APC, sixel DCS, OSC 1337) that only terminates at its trailing ST; a
+/// SIGINT mid-write (e.g. Ctrl+C during the ~3.5 s pty stream of a large
+/// image) leaves the terminal waiting for the rest, so the following shell
+/// prompt is swallowed as payload. Before dying we write CAN (`0x18`) +
+/// ST (`ESC \`), which closes any half-open APC/DCS/OSC immediately.
+extern "C" fn fast_exit_handler(_: libc::c_int) {
+    // write(2)/signal(2)/raise(2) are async-signal-safe; write into the raw
+    // fd instead of the Rust stdout handle (non-reentrant, may hold a lock).
+    let seq: [u8; 3] = [0x18, 0x1b, 0x5c];
+    unsafe {
+        libc::write(1, seq.as_ptr().cast(), seq.len());
+        // Installing this handler replaced the default terminate action; die
+        // the way SIGINT would have (shell sees 130) after the repair write.
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::raise(libc::SIGINT);
+    }
+}
+
+fn install_fast_exit() {
+    // Reroute SIGINT from default-die to the repair-then-die handler.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = fast_exit_handler as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        // sa_mask differs between libc targets; zero it via the union-free
+        // fields both macOS and Linux expose.
+        #[cfg(target_os = "macos")]
+        {
+            sa.sa_mask = std::mem::zeroed();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            libc::sigemptyset(&mut sa.sa_mask);
+        }
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
+}
+
 impl fmt::Display for AppErr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -63,6 +103,7 @@ impl fmt::Display for AppErr {
 }
 
 fn run(args: &cli::Args) -> Result<(), AppErr> {
+    install_fast_exit();
     let sources = build_sources(args)?;
     let stdout = io::stdout();
     if args.info {
