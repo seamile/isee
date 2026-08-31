@@ -88,14 +88,20 @@ pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
         if tmux {
             enable_tmux_passthrough();
         }
-        // KGP queries leak their APC payload as visible text on
-        // unsupporting terminals, so they only run when the kitty protocol
-        // still needs evidence: forced kitty (the probe confirms tempfile
-        // transport), or auto with no brand-table default (its measured
-        // matrix already carries the verdict; skipping saves the scan).
+        // Forced kitty still needs the tempfile-transport confirmation, and
+        // an UNKNOWN brand needs the full scan (XTVERSION identifies it,
+        // DA1 reports sixel, KGP probes decide kitty). A brand-table hit, by
+        // contrast, already carries the verdict from the measured matrix —
+        // probing it again burns a full scan and leaks the KGP APC on the
+        // very terminals KGP cannot render on. So the batch runs only when
+        // `want_kgp` is true; otherwise we trust the env-detected brand.
         let want_kgp = forced == Some(Protocol::Kitty)
             || (forced.is_none() && brand.and_then(crate::brand::preferred_protocol).is_none());
-        let answers = probe_batch(&mut tty, tmux, want_kgp);
+        let answers = if want_kgp {
+            probe_batch(&mut tty, tmux, true)
+        } else {
+            ProbeAnswers::default()
+        };
         if let Some(b) = answers.brand {
             brand = Some(b);
         }
@@ -151,17 +157,14 @@ pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
     // but halves it again on iTerm2 (there, `-w 2x` means QuickLook size).
     let dpy_scale = isee_dpi_scale().unwrap_or(1);
     // Brand-table selection skips the KGP probe for recognized terminals, so
-    // its tempfile verdict is missing for the native KGP brands (kitty,
-    // Ghostty, WezTerm — all three transport temp files by protocol design);
-    // default them to tempfile so the skipped probe does not silently cost
-    // the direct-placement speedup. `ISEE_KGP_TRANSFER=stream` still opts
-    // out, and iTerm2/VSCode/Warp keep the conservative stream default.
-    let brand_kgp = matches!(
-        brand,
-        Some(crate::brand::Brand::KittyFamily)
-            | Some(crate::brand::Brand::Ghostty)
-            | Some(crate::brand::Brand::WezTerm)
-    );
+    // its tempfile verdict is missing for every brand that prefers KGP
+    // (kitty, Ghostty, WezTerm, iTerm2, VSCode, Warp — they all render kitty
+    // graphics and accept a temp-file transfer by protocol design); default
+    // them to tempfile so the skipped probe does not silently cost the
+    // direct-placement speedup. `ISEE_KGP_TRANSFER=stream` still opts out.
+    let brand_kgp = brand
+        .and_then(crate::brand::preferred_protocol)
+        .is_some_and(|p| p == Protocol::Kitty);
     let kgp_transfer = kgp_transfer_choice(
         (probed_kitty && probed_file) || brand_kgp,
         env::var("ISEE_KGP_TRANSFER").ok().as_deref(),

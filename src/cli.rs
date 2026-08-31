@@ -57,8 +57,8 @@ Options:
              may exceed the window (the terminal scrolls vertically).
   -q QUALITY Preview scaling quality: L (nearest), M (triangle), H (lanczos);
              default M
-  -p PROTO   Force the preview protocol: auto (default), kitty, iip,
-             sixel or halfblock
+  -p PROTO   Specify the preview protocol: auto (default),
+             K[itty], I[term], S[ixel], H[alfblock]
   -i         Show image information
   -a         Animate GIFs where the terminal supports it (kitty; iTerm2,
              mintty), else fall back to the first frame
@@ -132,10 +132,10 @@ fn parse_quality(v: &str) -> Result<Quality, ParseError> {
 fn parse_protocol(v: &str) -> Result<Option<Protocol>, ParseError> {
     match v.trim().to_ascii_lowercase().as_str() {
         "auto" => Ok(None),
-        "kitty" => Ok(Some(Protocol::Kitty)),
-        "iip" => Ok(Some(Protocol::Iip)),
-        "sixel" => Ok(Some(Protocol::Sixel)),
-        "halfblock" | "halfblocks" => Ok(Some(Protocol::HalfBlocks)),
+        "kitty" | "kgp" | "k" => Ok(Some(Protocol::Kitty)),
+        "iterm" | "iip" | "i" => Ok(Some(Protocol::Iip)),
+        "sixel" | "six" | "s" => Ok(Some(Protocol::Sixel)),
+        "halfblock" | "hb" | "h" => Ok(Some(Protocol::HalfBlocks)),
         _ => Err(ParseError::InvalidProtocol(v.trim().to_string())),
     }
 }
@@ -216,6 +216,9 @@ mod tests {
         assert_eq!(parse(["-q", "l"]).unwrap().quality, Quality::Low);
         assert_eq!(parse(["-q", "m"]).unwrap().quality, Quality::Medium);
         assert_eq!(parse(["-q", "h"]).unwrap().quality, Quality::High);
+        assert_eq!(parse(["-qL"]).unwrap().quality, Quality::Low);
+        assert_eq!(parse(["-q", "M"]).unwrap().quality, Quality::Medium);
+        assert_eq!(parse(["-qH"]).unwrap().quality, Quality::High);
         assert!(matches!(
             parse(["-q", "80"]),
             Err(ParseError::InvalidQuality(v)) if v == "80"
@@ -243,8 +246,36 @@ mod tests {
             parse(["-p", "halfblock"]).unwrap().protocol,
             Some(Protocol::HalfBlocks)
         );
+    }
+
+    #[test]
+    fn parse_protocol_aliases_case_insensitive() {
         assert_eq!(
-            parse(["-p", "halfblocks"]).unwrap().protocol,
+            parse(["-p", "kgp"]).unwrap().protocol,
+            Some(Protocol::Kitty)
+        );
+        assert_eq!(parse(["-pk"]).unwrap().protocol, Some(Protocol::Kitty));
+        assert_eq!(
+            parse(["-p", "KITTY"]).unwrap().protocol,
+            Some(Protocol::Kitty)
+        );
+        assert_eq!(
+            parse(["-p", "ITERM"]).unwrap().protocol,
+            Some(Protocol::Iip)
+        );
+        assert_eq!(parse(["-pi"]).unwrap().protocol, Some(Protocol::Iip));
+        assert_eq!(
+            parse(["-p", "six"]).unwrap().protocol,
+            Some(Protocol::Sixel)
+        );
+        assert_eq!(parse(["-pS"]).unwrap().protocol, Some(Protocol::Sixel));
+        assert_eq!(
+            parse(["-p", "hb"]).unwrap().protocol,
+            Some(Protocol::HalfBlocks)
+        );
+        assert_eq!(parse(["-ph"]).unwrap().protocol, Some(Protocol::HalfBlocks));
+        assert_eq!(
+            parse(["-pHALFBLOCK"]).unwrap().protocol,
             Some(Protocol::HalfBlocks)
         );
     }
