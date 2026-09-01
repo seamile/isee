@@ -33,17 +33,20 @@ impl Bounds {
 }
 
 /// Scaling bounds for bitmap protocols drawn by the terminal itself
-/// (Iip/Sixel), in LOGICAL pixels: the probed/logical cell times the grid.
-/// How a declared `Npx` size actually renders is brand-dependent (measured
-/// on a 2x Retina display): Warp & co draw one image pixel per logical
-/// point, but iTerm2 draws one image pixel per DEVICE pixel — these bounds
-/// follow yazi's logical-cell convention for both drivers, so they are
-/// exact on Warp and conservative (2x) on iTerm2, whose auto-fit still
-/// clamps the result. KGP instead maps an image pixel to a device pixel.
+/// (Iip/Sixel), in the terminal's own render pixels: the physical cell times
+/// the grid. A declared OSC 1337 `Npx` and a Sixel pixel are both DEVICE
+/// pixels (measured on a 2x Retina display), so a HiDPI terminal needs the
+/// physical cell, not the probed logical one — the old logical-cell bound
+/// capped previews at half the window. The physical cell is `kitty_cell`
+/// (the max of the probed cell and `win.px`/grid), which folds in the raw
+/// window-pixel report; that report is device px on kitty/Ghostty/iTerm2 and
+/// points on Warp, which is exactly the unit each brand renders a declared
+/// px in, so the bound stays exact for both.
 pub fn bitmap_bounds(o: &RenderOpts) -> Bounds {
+    let (cw, ch) = kitty_cell(o);
     Bounds::window(
-        (o.win.cols as u64 * o.cell.w.max(1) as u64).max(1),
-        (o.win.rows as u64 * o.cell.h.max(1) as u64).max(1),
+        (o.win.cols as u64 * cw as u64).max(1),
+        (o.win.rows as u64 * ch as u64).max(1),
     )
 }
 
@@ -510,18 +513,19 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_bounds_stay_logical_on_hidpi() {
+    fn bitmap_bounds_use_physical_cell_on_hidpi() {
         // Without a px report both bounds formulas degenerate to the same
         // logical grid...
         let mut o = opts();
         assert_eq!(bitmap_bounds(&o), kitty_bounds(&o));
         assert_eq!((bitmap_bounds(&o).w, bitmap_bounds(&o).h), (720, 432));
-        // ...but on HiDPI only the KITTY bounds double: OSC 1337 and Sixel
-        // render one image pixel per logical point, so their bounds must
-        // stay at the logical cell (9x18), not the physical one (18x36).
+        // ...and on HiDPI the bitmap bounds double with the kitty bounds:
+        // OSC 1337 and Sixel render one declared pixel per DEVICE pixel, so
+        // their bounds must use the physical cell (18x36), not the logical
+        // one (9x18) — otherwise a preview would cap at half the window.
         o.win.px = Some((1440, 864));
         assert_eq!((kitty_bounds(&o).w, kitty_bounds(&o).h), (1440, 864));
-        assert_eq!((bitmap_bounds(&o).w, bitmap_bounds(&o).h), (720, 432));
+        assert_eq!((bitmap_bounds(&o).w, bitmap_bounds(&o).h), (1440, 864));
     }
 
     #[test]
