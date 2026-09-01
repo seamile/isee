@@ -158,15 +158,28 @@ pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
     let dpy_scale = isee_dpi_scale().unwrap_or(1);
     // Brand-table selection skips the KGP probe for recognized terminals, so
     // its tempfile verdict is missing for every brand that prefers KGP
-    // (kitty, Ghostty, WezTerm, iTerm2, VSCode, Warp — they all render kitty
+    // (kitty, Ghostty, WezTerm, iTerm2, VSCode — they all render kitty
     // graphics and accept a temp-file transfer by protocol design); default
     // them to tempfile so the skipped probe does not silently cost the
     // direct-placement speedup. `ISEE_KGP_TRANSFER=stream` still opts out.
+    //
+    // When the probe DID run (`probed_kitty`), its tempfile verdict is
+    // authoritative and must win over the brand default. Warp is the one
+    // brand whose current release rejects `t=t` (FileError
+    // UnsupportedPlatform), so it must never default to Tempfile: when its
+    // probe is skipped it streams, and when its probe runs it trusts the
+    // (negative) verdict.
     let brand_kgp = brand
         .and_then(crate::brand::preferred_protocol)
         .is_some_and(|p| p == Protocol::Kitty);
+    let brand_tempfile = brand_kgp && brand != Some(crate::brand::Brand::Warp);
+    let probed_tempfile = if probed_kitty {
+        probed_file
+    } else {
+        brand_tempfile
+    };
     let kgp_transfer = kgp_transfer_choice(
-        (probed_kitty && probed_file) || brand_kgp,
+        probed_tempfile,
         env::var("ISEE_KGP_TRANSFER").ok().as_deref(),
     );
 
