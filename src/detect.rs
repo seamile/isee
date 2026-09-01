@@ -48,6 +48,10 @@ pub struct TerminalInfo {
     /// Env-recognized terminal brand (see `brand::detect`); gates
     /// brand-specific behavior such as the Iip GIF-animation whitelist.
     pub brand: Option<crate::brand::Brand>,
+    /// True only when `-p` chose the protocol (`auto` and `ISEE_PROTOCOL`
+    /// are NOT forced): rendering never second-guesses a forced protocol —
+    /// the iTerm2 KGP-animation downgrade keys off this.
+    pub forced: bool,
     /// How kitty-protocol payloads should reach the terminal: probed
     /// tempfile support (`t=1`), or the `ISEE_KGP_TRANSFER` override.
     pub kgp_transfer: KgpTransfer,
@@ -191,11 +195,12 @@ pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
         dpy_scale,
         probed_scale,
         brand,
+        forced: forced.is_some(),
         kgp_transfer,
     };
     if env::var("ISEE_DEBUG").is_ok() {
         eprintln!(
-            "isee: protocol={:?} cell={}x{} win={}x{} px={:?} scale={} probed_scale={:?} tmux={} transfer={:?}",
+            "isee: protocol={:?} cell={}x{} win={}x{} px={:?} scale={} probed_scale={:?} tmux={} transfer={:?} brand={:?} forced={}",
             info.protocol,
             info.cell.w,
             info.cell.h,
@@ -205,7 +210,9 @@ pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
             info.dpy_scale,
             info.probed_scale,
             tmux,
-            info.kgp_transfer
+            info.kgp_transfer,
+            info.brand,
+            info.forced
         );
     }
     info

@@ -268,8 +268,11 @@ fn wrap_tmux(block: Vec<u8>, term: &detect::TerminalInfo) -> Vec<u8> {
 /// on Kitty (native animation protocol) and, when it is a GIF, on
 /// iTerm2/mintty (OSC 1337 passes the raw GIF through for the terminal to
 /// play); animated WebPs and every other protocol show the first frame as a
-/// static image. Pure function of (loaded, term, opts): safe to call from
-/// worker threads.
+/// static image. Auto-detected iTerm2 renders GIFs via IIP even when the
+/// protocol is Kitty: iTerm2's kitty-graphics support excludes animation
+/// (release notes: "except animation"), so the KGP sequence would sit on the
+/// first frame — only `-p kitty` (forced) suppresses the downgrade. Pure
+/// function of (loaded, term, opts): safe to call from worker threads.
 fn render_loaded(
     loaded: &input::Loaded,
     term: &detect::TerminalInfo,
@@ -278,29 +281,37 @@ fn render_loaded(
     match loaded {
         input::Loaded::Static(img) => render_block(img, term, opts),
         input::Loaded::Anim(anim) => {
-            let animated = match term.protocol {
-                Protocol::Kitty => true,
-                // Only the OSC 1337 brands that actually play GIF payloads
-                // animate; the rest (Warp, VSCode, ...) show the first frame.
-                Protocol::Iip => {
-                    anim.kind == input::AnimKind::Gif
-                        && matches!(
-                            term.brand,
-                            Some(brand::Brand::Iterm2) | Some(brand::Brand::Mintty)
-                        )
-                }
-                _ => false,
-            };
-            let block = if animated {
-                match term.protocol {
-                    Protocol::Kitty => kitty::render_animation(
-                        &anim.frames,
-                        anim.loop_count,
-                        opts,
-                        kitty::new_image_id(),
-                    ),
-                    _ => iip::render_gif_raw(&anim.raw, opts, &anim.frames[0].img),
-                }
+            // iTerm2 accepts KGP static images but does not animate them; in
+            // auto mode its GIFs ride the OSC 1337 raw passthrough instead.
+            // `-p kitty` is never second-guessed.
+            let iterm2_kgp_downgrade = !term.forced
+                && term.protocol == Protocol::Kitty
+                && term.brand == Some(brand::Brand::Iterm2)
+                && anim.kind == input::AnimKind::Gif;
+            let animated = iterm2_kgp_downgrade
+                || match term.protocol {
+                    Protocol::Kitty => true,
+                    // Only the OSC 1337 brands that actually play GIF payloads
+                    // animate; the rest (Warp, VSCode, ...) show the first frame.
+                    Protocol::Iip => {
+                        anim.kind == input::AnimKind::Gif
+                            && matches!(
+                                term.brand,
+                                Some(brand::Brand::Iterm2) | Some(brand::Brand::Mintty)
+                            )
+                    }
+                    _ => false,
+                };
+            let osc_gif_passthrough = term.protocol == Protocol::Iip
+                && anim.kind == input::AnimKind::Gif
+                && matches!(
+                    term.brand,
+                    Some(brand::Brand::Iterm2) | Some(brand::Brand::Mintty)
+                );
+            let block = if animated && (iterm2_kgp_downgrade || osc_gif_passthrough) {
+                iip::render_gif_raw(&anim.raw, opts, &anim.frames[0].img)
+            } else if animated {
+                kitty::render_animation(&anim.frames, anim.loop_count, opts, kitty::new_image_id())
             } else {
                 render_block(&anim.frames[0].img, term, opts)
             };
@@ -713,6 +724,7 @@ mod tests {
             dpy_scale: 1,
             probed_scale: None,
             brand,
+            forced: false,
             kgp_transfer: size::KgpTransfer::Stream,
         }
     }
@@ -751,6 +763,45 @@ mod tests {
         let s = String::from_utf8_lossy(&block);
         assert!(s.contains("\x1b_Ga=f"), "frame transfers: {s}");
         assert!(s.contains("\x1b_Ga=a,i="), "animation controls: {s}");
+    }
+
+    #[test]
+    fn iterm2_kgp_gif_downgrades_to_osc_passthrough_unless_forced() {
+        // Auto-detected iTerm2 on the kitty protocol: iTerm2's KGP support
+        // excludes animation, so the GIF rides the OSC 1337 raw passthrough.
+        let term = term_of(Protocol::Kitty, Some(brand::Brand::Iterm2), false);
+        assert!(osc_payload_is_gif(&render_loaded(
+            &gif_loaded(),
+            &term,
+            &opts()
+        )));
+
+        // `-p kitty` is never second-guessed: the native KGP animation
+        // sequence goes out untouched.
+        let mut forced = term_of(Protocol::Kitty, Some(brand::Brand::Iterm2), false);
+        forced.forced = true;
+        let block = render_loaded(&gif_loaded(), &forced, &opts());
+        let s = String::from_utf8_lossy(&block);
+        assert!(
+            s.contains("\x1b_Ga=f"),
+            "forced kitty keeps KGP animation: {s}"
+        );
+        assert!(
+            s.contains("\x1b_Ga=a,i="),
+            "forced kitty keeps KGP animation: {s}"
+        );
+
+        // Animated WebPs never pass through OSC 1337 (no OSC terminal plays
+        // them): iTerm2 still gets the KGP sequence, which shows the first
+        // frame — same as Ghostty.
+        let mut webp = gif_loaded();
+        if let input::Loaded::Anim(anim) = &mut webp {
+            anim.kind = input::AnimKind::Webp;
+        }
+        let block = render_loaded(&webp, &term, &opts());
+        let s = String::from_utf8_lossy(&block);
+        assert!(s.contains("\x1b_Ga=f"), "webp stays on KGP: {s}");
+        assert!(!s.contains("\x1b]1337;"), "webp never rides OSC: {s}");
     }
 
     #[test]
