@@ -4,6 +4,8 @@ mod cli;
 mod detect;
 mod halfblock;
 mod iip;
+#[cfg(target_os = "macos")]
+mod imageio;
 mod info;
 mod input;
 mod kitty;

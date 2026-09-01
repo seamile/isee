@@ -56,14 +56,16 @@ to height.
 
 `isee` decodes the following formats. Raster formats go through the Rust
 `image` crate; SVG is rasterized with the pure-Rust `resvg`, including gzipped
-`.svgz`:
+`.svgz`; HEIC/HEIF on macOS is decoded by the system ImageIO framework:
 
 PNG, JPEG, GIF, WebP, BMP, PNM (PBM/PGM/PPM), QOI, Farbfeld, ICO, TIFF,
-Radiance HDR, OpenEXR, SVG
+Radiance HDR, OpenEXR, SVG, HEIC/HEIF (macOS 10.13+)
 
-Not supported: JPEG2000 and HEIC need external rasterizers/decoders outside
-the `image` crate; TGA is not content-detectable by `image`, and pure Rust
-AVIF support is encoder-only, so neither renders in `isee`.
+Not supported: JPEG2000 needs an external rasterizer outside the `image`
+crate; TGA is not content-detectable by `image`; AVIF decoding in `image`
+requires the `avif-native` feature and a system libdav1d (its `avif` feature
+is encoder-only), so neither renders in `isee`. On Linux, HEIC/HEIF files are
+reported as unsupported.
 
 ## Examples
 

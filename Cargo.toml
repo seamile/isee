@@ -31,6 +31,20 @@ resvg = { version = "0.48.1", default-features = false, features = ["text", "sys
 palette   = { version = "0.7.7", default-features = false }
 quantette = { version = "0.6.0", default-features = false }
 
+# HEIC decoding rides the system ImageIO/CoreGraphics frameworks on macOS
+# (no libheif, nothing dynamic to ship). Feature sets are kept minimal.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std", "CFData", "CFDictionary", "CFNumber", "CFString", "CFArray",
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGGeometry",
+    "CGImage", "CGDataProvider",
+] }
+objc2-image-io = { version = "0.3.2", default-features = false, features = [
+    "std", "objc2", "objc2-core-graphics", "CGImageSource", "CGImageProperties",
+] }
+
 [profile.release]
 opt-level = 3
 lto = true

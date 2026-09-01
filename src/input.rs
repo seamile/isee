@@ -102,6 +102,16 @@ fn decode_full(buf: &[u8]) -> Result<(DynamicImage, ColorType), Box<dyn std::err
         let color = img.color();
         return Ok((img, color));
     }
+    #[cfg(target_os = "macos")]
+    if crate::imageio::is_heif(buf) {
+        let img = crate::imageio::decode(buf, |w, h| {
+            check_preview_size(w, h)?;
+            check_preview_alloc(w, h, u64::from(w) * u64::from(h) * 4)?;
+            Ok(())
+        })?;
+        let color = img.color();
+        return Ok((img, color));
+    }
     let mut reader = ImageReader::new(Cursor::new(buf)).with_guessed_format()?;
     reader.limits(preview_limits());
     let mut decoder = reader.into_decoder()?;
@@ -139,6 +149,12 @@ fn decode_for_preview(
         && let Some(img) = decode_jpeg_scaled(buf, opts, bounds, dpy_scale)?
     {
         return Ok(img);
+    }
+    #[cfg(target_os = "macos")]
+    if crate::imageio::is_heif(buf) {
+        // decode_full applies the preview size/alloc guards itself.
+        let (img, _) = decode_full(buf)?;
+        return Ok(shrink_to_points(img, dpy_scale, opts, bounds));
     }
     let (img, _) = decode_full(buf)?;
     Ok(shrink_to_points(img, dpy_scale, opts, bounds))
@@ -737,6 +753,19 @@ pub fn load_info(source: &Source) -> Result<ImageInfo, Box<dyn std::error::Error
         });
     }
     let m = meta::extract(&buf);
+    #[cfg(target_os = "macos")]
+    if crate::imageio::is_heif(&buf) {
+        // Properties-only read: no pixel decode on the `-i` path.
+        let h = crate::imageio::load_info(&buf)?;
+        return Ok(ImageInfo {
+            size: buf.len() as u64,
+            width: h.width,
+            height: h.height,
+            dpi: h.dpi,
+            alpha: h.alpha,
+            color: h.color,
+        });
+    }
     let reader = ImageReader::new(Cursor::new(&buf[..])).with_guessed_format()?;
     let decoder = reader.into_decoder()?;
     let (width, height) = decoder.dimensions();
