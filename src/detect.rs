@@ -162,9 +162,9 @@ pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
     let dpy_scale = isee_dpi_scale().unwrap_or(1);
     // Brand-table selection skips the KGP probe for recognized terminals, so
     // its tempfile verdict is missing for every brand that prefers KGP
-    // (kitty, Ghostty, WezTerm, iTerm2, VSCode — they all render kitty
-    // graphics and accept a temp-file transfer by protocol design); default
-    // them to tempfile so the skipped probe does not silently cost the
+    // (kitty, Ghostty, WezTerm, iTerm2 — they all render kitty graphics and
+    // accept a temp-file transfer by protocol design); default them to
+    // tempfile so the skipped probe does not silently cost the
     // direct-placement speedup. `ISEE_KGP_TRANSFER=stream` still opts out.
     //
     // When the probe DID run (`probed_kitty`), its tempfile verdict is

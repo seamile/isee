@@ -17,8 +17,8 @@ An image viewer for terminal, simple and fast.
 
 Detection reads the environment's brand table; terminals it does not know are probed for their XTVERSION self-report, so even terminals whose env vars do not survive ssh are identified. Recognized terminals map to a protocol as follows.
 
-- **KGP**: kitty, Ghostty, WezTerm, iTerm2, VS Code, Warp (VS Code needs `terminal.integrated.enableImages: true` — off by default)
-- **IIP**: mintty, Tabby, Bobcat
+- **KGP**: kitty, Ghostty, WezTerm, iTerm2, Warp
+- **IIP**: mintty, Tabby, Bobcat, VS Code (VS Code needs `terminal.integrated.enableImages: true` — off by default)
 - **Sixel**: Foot, Konsole, Windows Terminal, BlackBox
 - **Half Blocks**: Hyper — it supports no bitmap protocol at all
 

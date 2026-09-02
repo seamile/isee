@@ -108,12 +108,18 @@ pub fn from_version_str(resp: &str) -> Option<Brand> {
 /// order KGP > IIP > Sixel > Half Blocks, per the measured support matrix
 /// (user-tested 2026-08-31). isee's KGP path is the fastest (direct
 /// placement, tempfile transport), so it has top priority.
-/// - KGP brands: Kitty, Ghostty, iTerm2, WezTerm, VSCode, Warp.
+/// - KGP brands: Kitty, Ghostty, iTerm2, WezTerm, Warp.
 /// - Konsole/Foot/Windows Terminal/BlackBox speak Sixel (Konsole ships only a
 ///   legacy KGP snapshot we do not implement, a deliberate deviation).
-/// - Mintty/Tabby/Bobcat speak IIP (VSCode additionally needs
+/// - Mintty/Tabby/Bobcat/VSCode speak IIP (VSCode additionally needs
 ///   `terminal.integrated.enableImages: true`, off by default — until enabled
 ///   it just shows garbage-free text).
+///
+/// VSCode is deliberately NOT a KGP brand (measured 2026-09-02): its kitty
+/// implementation rejects the tempfile transport ("EINVALID: unsupported
+/// transmission medium"), and a brand hit skips the probe, so the KGP default
+/// used to emit a `t=t` payload that rendered nothing. IIP renders fine;
+/// `-p kitty` still works — the forced probe finds no tempfile and streams.
 /// - Hyper supports no bitmap protocol at all (its xterm.js base has no OSC
 ///   1337 renderer; the official imgcat script fails too, tested 2026-08).
 /// - Rio stays None and rides the KGP probe: its support was not measured,
@@ -121,14 +127,11 @@ pub fn from_version_str(resp: &str) -> Option<Brand> {
 ///   (no known bitmap protocol).
 pub fn preferred_protocol(b: Brand) -> Option<Protocol> {
     match b {
-        Brand::KittyFamily
-        | Brand::Ghostty
-        | Brand::WezTerm
-        | Brand::Iterm2
-        | Brand::Vscode
-        | Brand::Warp => Some(Protocol::Kitty),
+        Brand::KittyFamily | Brand::Ghostty | Brand::WezTerm | Brand::Iterm2 | Brand::Warp => {
+            Some(Protocol::Kitty)
+        }
         Brand::Konsole | Brand::Foot | Brand::Microsoft | Brand::BlackBox => Some(Protocol::Sixel),
-        Brand::Mintty | Brand::Tabby | Brand::Bobcat => Some(Protocol::Iip),
+        Brand::Mintty | Brand::Tabby | Brand::Bobcat | Brand::Vscode => Some(Protocol::Iip),
         Brand::Hyper => Some(Protocol::HalfBlocks),
         Brand::Rio | Brand::Apple | Brand::Urxvt | Brand::Unknown => None,
     }
@@ -239,7 +242,6 @@ mod tests {
             Brand::Ghostty,
             Brand::WezTerm,
             Brand::Iterm2,
-            Brand::Vscode,
             Brand::Warp,
         ] {
             assert_eq!(preferred_protocol(b), Some(Protocol::Kitty), "{b:?}");
@@ -252,7 +254,7 @@ mod tests {
         ] {
             assert_eq!(preferred_protocol(b), Some(Protocol::Sixel), "{b:?}");
         }
-        for b in [Brand::Mintty, Brand::Tabby, Brand::Bobcat] {
+        for b in [Brand::Mintty, Brand::Tabby, Brand::Bobcat, Brand::Vscode] {
             assert_eq!(preferred_protocol(b), Some(Protocol::Iip), "{b:?}");
         }
         // Hyper supports no bitmap protocol at all (measured).
