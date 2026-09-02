@@ -9,12 +9,15 @@
 use std::ffi::c_void;
 
 use objc2_core_foundation::{
-    CFData, CFDictionary, CFNumber, CFNumberType, CFString, CGPoint, CGRect, CGSize,
+    CFBoolean, CFData, CFDictionary, CFNumber, CFNumberType, CFString, CFType, CGPoint, CGRect,
+    CGSize,
 };
 use objc2_core_graphics::{CGBitmapContextCreate, CGColorSpace, CGContext, CGImage};
 use objc2_image_io::{
     CGImageSource, kCGImagePropertyDPIWidth, kCGImagePropertyHasAlpha, kCGImagePropertyOrientation,
     kCGImagePropertyPixelHeight, kCGImagePropertyPixelWidth,
+    kCGImageSourceCreateThumbnailFromImageAlways, kCGImageSourceCreateThumbnailWithTransform,
+    kCGImageSourceThumbnailMaxPixelSize,
 };
 
 use image::metadata::Orientation;
@@ -172,63 +175,104 @@ pub fn decode(
 ) -> Result<DynamicImage, Box<dyn std::error::Error>> {
     let p = heif_properties(buf)?;
     check(p.width, p.height)?;
+    let (source, index) = image_source(buf)?;
+    let cg_image = unsafe { source.image_at_index(index, None) }
+        .ok_or("ImageIO could not decode this HEIF image")?;
+    cg_image_to_dynamic(&cg_image, p.has_alpha, p.orientation, &check)
+}
 
+/// Decode a preview through ImageIO's native thumbnail path. The system
+/// decoder applies orientation and performs HEVC downsampling before the
+/// bitmap exists, avoiding a full 100–200 MiB raster for phone/camera images.
+pub fn decode_thumbnail(
+    buf: &[u8],
+    max_pixel_size: u32,
+    check: impl Fn(u32, u32) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<DynamicImage, Box<dyn std::error::Error>> {
+    let p = heif_properties(buf)?;
+    check(p.width, p.height)?;
+    let (source, index) = image_source(buf)?;
+    let max_size = CFNumber::new_i64(i64::from(max_pixel_size.max(1)));
+    let always = CFBoolean::new(true);
+    let options = unsafe {
+        let keys: [&CFType; 3] = [
+            kCGImageSourceCreateThumbnailFromImageAlways.as_ref(),
+            kCGImageSourceThumbnailMaxPixelSize.as_ref(),
+            kCGImageSourceCreateThumbnailWithTransform.as_ref(),
+        ];
+        let values: [&CFType; 3] = [always.as_ref(), max_size.as_ref(), always.as_ref()];
+        CFDictionary::<CFType, CFType>::from_slices(&keys, &values)
+    };
+    let options: &CFDictionary = options.as_ref();
+    let cg_image = unsafe { source.thumbnail_at_index(index, Some(options)) }
+        .ok_or("ImageIO could not decode a HEIF thumbnail")?;
+    // CreateThumbnailWithTransform has already applied orientation.
+    cg_image_to_dynamic(&cg_image, p.has_alpha, Orientation::NoTransforms, &check)
+}
+
+fn image_source(
+    buf: &[u8],
+) -> Result<(objc2_core_foundation::CFRetained<CGImageSource>, usize), Box<dyn std::error::Error>> {
     let data = CFData::from_bytes(buf);
     let source = unsafe { CGImageSource::with_data(&data, None) }
         .ok_or("ImageIO rejected this HEIF container")?;
     let index = unsafe { source.primary_image_index() };
-    let cg_image = unsafe { source.image_at_index(index, None) }
-        .ok_or("ImageIO could not decode this HEIF image")?;
+    Ok((source, index))
+}
 
-    // Decoded reality wins over declared properties.
-    let w = u32::try_from(CGImage::width(Some(&cg_image)))
+fn cg_image_to_dynamic(
+    cg_image: &CGImage,
+    has_alpha: bool,
+    orientation: Orientation,
+    check: &impl Fn(u32, u32) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<DynamicImage, Box<dyn std::error::Error>> {
+    let raw_w = u32::try_from(CGImage::width(Some(cg_image)))
         .map_err(|_| "decoded HEIF width exceeds u32")?;
-    let h = u32::try_from(CGImage::height(Some(&cg_image)))
+    let raw_h = u32::try_from(CGImage::height(Some(cg_image)))
         .map_err(|_| "decoded HEIF height exceeds u32")?;
-    let (w, h) = oriented_dims(w, h, p.orientation);
-    check(w, h)?;
+    let (display_w, display_h) = oriented_dims(raw_w, raw_h, orientation);
+    check(display_w, display_h)?;
 
-    // Render into a tightly-packed RGBA buffer. `kCGImageAlphaPremultipliedLast`
-    // (1) names the alpha "last" in the byte layout, i.e. literal R,G,B,A
-    // bytes on either host endianness. Byte-order flags (kCGBitmapByteOrder*)
-    // are NOT accepted here — CGBitmapContextCreate rejects every 8-bit RGB
-    // combination that pins an explicit byte order (verified on-device), so
-    // the native order is the only supported layout.
+    // The bitmap must use the decoded image's RAW grid. Applying orientation
+    // before drawing would stretch 90/270-degree images into swapped bounds;
+    // rotate the DynamicImage only after CoreGraphics has rendered it.
     let bitmap_info = 1u32; // kCGImageAlphaPremultipliedLast
     let space = CGColorSpace::new_device_rgb().ok_or("no DeviceRGB color space")?;
-    let mut pixels = vec![0u8; w as usize * h as usize * 4];
+    let mut pixels = vec![0u8; raw_w as usize * raw_h as usize * 4];
     let context = unsafe {
         CGBitmapContextCreate(
             pixels.as_mut_ptr().cast(),
-            w as usize,
-            h as usize,
+            raw_w as usize,
+            raw_h as usize,
             8,
-            w as usize * 4,
+            raw_w as usize * 4,
             Some(&space),
             bitmap_info,
         )
     }
     .ok_or("could not create the CoreGraphics bitmap context")?;
-    let rect = CGRect::new(CGPoint::ZERO, CGSize::new(f64::from(w), f64::from(h)));
-    CGContext::draw_image(Some(&context), rect, Some(&cg_image));
+    let rect = CGRect::new(
+        CGPoint::ZERO,
+        CGSize::new(f64::from(raw_w), f64::from(raw_h)),
+    );
+    CGContext::draw_image(Some(&context), rect, Some(cg_image));
 
-    if p.has_alpha {
+    let mut img = if has_alpha {
         demultiply(&mut pixels);
-        let img = image::RgbaImage::from_raw(w, h, pixels).ok_or("HEIF buffer size mismatch")?;
-        Ok(DynamicImage::ImageRgba8(img))
+        let img =
+            image::RgbaImage::from_raw(raw_w, raw_h, pixels).ok_or("HEIF buffer size mismatch")?;
+        DynamicImage::ImageRgba8(img)
     } else {
-        // The context was RGBA; drop the alpha channel for a pure RGB image.
-        let mut rgb = Vec::with_capacity(w as usize * h as usize * 3);
+        let mut rgb = Vec::with_capacity(raw_w as usize * raw_h as usize * 3);
         for px in pixels.as_chunks::<4>().0 {
             rgb.extend_from_slice(&px[..3]);
         }
-        let img = image::RgbImage::from_raw(w, h, rgb).ok_or("HEIF buffer size mismatch")?;
-        Ok(DynamicImage::ImageRgb8(img))
-    }
-    .map(|mut img| {
-        img.apply_orientation(p.orientation);
-        img
-    })
+        let img =
+            image::RgbImage::from_raw(raw_w, raw_h, rgb).ok_or("HEIF buffer size mismatch")?;
+        DynamicImage::ImageRgb8(img)
+    };
+    img.apply_orientation(orientation);
+    Ok(img)
 }
 
 /// In-place premultiplied → straight alpha with rounding.
@@ -314,6 +358,17 @@ mod tests {
             (bottom[0], bottom[1], bottom[2], bottom[3]),
             (0, 0, 255, 128)
         );
+    }
+
+    #[test]
+    fn fixture_thumbnail_preserves_aspect_and_alpha() {
+        let img = decode_thumbnail(FIXTURE, 16, |_, _| Ok(())).expect("thumbnail decode");
+        assert_eq!((img.width(), img.height()), (16, 12));
+        assert_eq!(img.color(), ColorType::Rgba8);
+        let rgba = img.to_rgba8();
+        let bottom = rgba.get_pixel(8, 10);
+        assert_eq!(bottom[3], 128);
+        assert!(bottom[2] >= 250, "blue channel was {}", bottom[2]);
     }
 
     #[test]

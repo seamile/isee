@@ -152,9 +152,38 @@ fn decode_for_preview(
     }
     #[cfg(target_os = "macos")]
     if crate::imageio::is_heif(buf) {
-        // decode_full applies the preview size/alloc guards itself.
-        let (img, _) = decode_full(buf)?;
-        return Ok(shrink_to_points(img, dpy_scale, opts, bounds));
+        let info = crate::imageio::load_info(buf)?;
+        check_preview_size(info.width, info.height)?;
+        check_preview_alloc(
+            info.width,
+            info.height,
+            u64::from(info.width) * u64::from(info.height) * 4,
+        )?;
+        let target = size::target_dims(
+            info.width.div_ceil(dpy_scale),
+            info.height.div_ceil(dpy_scale),
+            opts,
+            bounds,
+        );
+        let source_max = info.width.max(info.height);
+        let decode_max = target.0.max(target.1).saturating_mul(2).min(source_max);
+        let mut img = if decode_max < source_max {
+            crate::imageio::decode_thumbnail(buf, decode_max, |w, h| {
+                check_preview_size(w, h)?;
+                check_preview_alloc(w, h, u64::from(w) * u64::from(h) * 4)?;
+                Ok(())
+            })?
+        } else {
+            crate::imageio::decode(buf, |w, h| {
+                check_preview_size(w, h)?;
+                check_preview_alloc(w, h, u64::from(w) * u64::from(h) * 4)?;
+                Ok(())
+            })?
+        };
+        if img.dimensions() != target {
+            img = img.resize_exact(target.0, target.1, size::filter(opts.quality));
+        }
+        return Ok(img);
     }
     let (img, _) = decode_full(buf)?;
     Ok(shrink_to_points(img, dpy_scale, opts, bounds))
