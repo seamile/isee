@@ -51,7 +51,7 @@ Preview images in the terminal.
 If IMGPATH is omitted, image data is read from stdin.
 
 Options:
-  -w WIDTH   Preview at the given pixel width.
+  -w WIDTH   Preview at the given pixel width; -w 0 uses the image's native width.
              Without -w, the terminal window width is the only cap. A
              preview is never wider than the terminal window; its height
              may exceed the window (the terminal scrolls vertically).
@@ -163,6 +163,7 @@ mod tests {
     #[test]
     fn parse_combined_short() {
         assert_eq!(parse(["-w800"]).unwrap().width, Some(800));
+        assert_eq!(parse(["-w0"]).unwrap().width, Some(0));
         let l = parse(["-ql"]).unwrap();
         assert_eq!(l.quality, Quality::Low);
         let m = parse(["-qM", "-i"]).unwrap();

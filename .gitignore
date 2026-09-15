@@ -24,6 +24,7 @@ debug/
 .kilo/
 .kilocodeignore
 .omo/
+.serena/
 AGENTS.md
 misc/
 reference/

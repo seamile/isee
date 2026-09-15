@@ -44,7 +44,7 @@ If `IMGPATH` is omitted, image data is read from `stdin`.
 
 ## Options
 
-- `-w WIDTH`: Preview at the given pixel width (e.g. `-w 800` for 800px)
+- `-w WIDTH`: Preview at the given pixel width (e.g. `-w 800` for 800px); `-w 0` uses the image's native width
 - `-q QUALITY`: Preview scaling quality: `L` (nearest, fastest), `M` (triangle, default), `H` (lanczos, sharpest)
 - `-p PROTOCOL`: Force the preview protocol: `auto` (default), `kitty`, `iip`, `sixel`, or `halfblock` — for terminals whose environment does not identify them (e.g. over ssh)
 - `-i`: Show image information (size, dimensions, DPI, colorspace, alpha)

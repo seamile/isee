@@ -226,6 +226,10 @@ pub fn target_dims(iw: u32, ih: u32, o: &RenderOpts, bounds: Bounds) -> (u32, u3
     let iw = iw.max(1) as u64;
     let ih = ih.max(1) as u64;
     let (tw, th) = match o.width {
+        // Zero means the source width: preserve the native aspect ratio while
+        // keeping the explicit-width behavior that lets images scroll taller
+        // than the window.
+        Some(0) => contain(iw, ih, bounds.w, bounds.h_cap.min(MAX_TARGET_DIMENSION)),
         // Explicit width: scale proportionally and cap the width at the
         // window (plus protocol hard caps). The height is NOT window-bound —
         // the terminal scrolls vertically — only the protocol's hard ceiling
@@ -565,6 +569,16 @@ mod tests {
         // A huge width request is capped by the terminal bounds (width-bound here).
         o.width = Some(5000);
         assert_eq!(target_dims(2000, 1000, &o, kitty_bounds(&o)), (1800, 900));
+    }
+
+    #[test]
+    fn zero_width_uses_native_width_and_explicit_height_rules() {
+        let mut o = opts();
+        o.width = Some(0);
+        let b = kitty_bounds(&o); // 720x432
+        assert_eq!(target_dims(600, 400, &o, b), (600, 400));
+        assert_eq!(target_dims(2000, 1000, &o, b), (720, 360));
+        assert_eq!(target_dims(1500, 4000, &o, b), (720, 1920));
     }
 
     #[test]
