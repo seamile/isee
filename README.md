@@ -36,6 +36,8 @@ Or download a prebuilt binary from the [releases page](https://github.com/seamil
 
 Building from source needs Rust 1.98 or newer and, on x86_64, `nasm` — the AV1 decoder behind AVIF support assembles its x86 kernels with it (`apt install nasm` on Debian/Ubuntu, `brew install nasm` on macOS). Prebuilt binaries need neither.
 
+On Intel macOS, Xcode 15's linker prints `no platform load command found in … assuming: macOS` once per object nasm produces. That warning is expected and harmless — nasm does not record a platform, macOS is correctly assumed, and any nasm-based project emits the same noise ([nasm bug 3392928](https://bugzilla.nasm.us/show_bug.cgi?id=3392928)).
+
 ## Usage
 
 ```
