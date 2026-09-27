@@ -34,6 +34,8 @@ cargo install isee
 
 Or download a prebuilt binary from the [releases page](https://github.com/seamile/isee/releases).
 
+Building from source needs Rust 1.98 or newer and, on x86_64, `nasm` — the AV1 decoder behind AVIF support assembles its x86 kernels with it (`apt install nasm` on Debian/Ubuntu, `brew install nasm` on macOS). Prebuilt binaries need neither.
+
 ## Usage
 
 ```
@@ -56,11 +58,13 @@ Without `-w`, the terminal window width is the only width cap. A preview is neve
 
 ## Supported formats
 
-`isee` decodes the following formats. Raster formats go through the Rust `image` crate; SVG is rasterized with the pure-Rust `resvg`, including gzipped `.svgz`; HEIC/HEIF on macOS is decoded by the system ImageIO framework:
+`isee` decodes the following formats. Raster formats go through the Rust `image` crate; SVG is rasterized with the pure-Rust `resvg`, including gzipped `.svgz`; AVIF goes through the pure-Rust `avif-decode`/`rav1d` decoder; HEIC/HEIF on macOS is decoded by the system ImageIO framework:
 
-PNG, JPEG, GIF, WebP, BMP, PNM (PBM/PGM/PPM), QOI, Farbfeld, ICO, TIFF, Radiance HDR, OpenEXR, SVG, HEIC/HEIF (macOS 10.13+)
+PNG, JPEG, GIF, WebP, BMP, PNM (PBM/PGM/PPM), QOI, Farbfeld, ICO, TIFF, Radiance HDR, OpenEXR, SVG, AVIF (still images), HEIC/HEIF (macOS 10.13+)
 
-Not supported: JPEG2000 needs an external rasterizer outside the `image` crate; TGA is not content-detectable by `image`; AVIF decoding in `image` requires the `avif-native` feature and a system libdav1d (its `avif` feature is encoder-only), so neither renders in `isee`. On Linux, HEIC/HEIF files are reported as unsupported.
+AVIF decoding is the pure-Rust `avif-decode`/`rav1d` (BSD-2-Clause, a Rust port of dav1d) with `avif-parse` (MPL-2.0) for the container. Shipping a binary that contains an AV1 decoder also requires carrying the [AOMedia Patent License 1.0](https://aomedia.org/license/patent-license/).
+
+Not supported: JPEG2000 needs an external rasterizer outside the `image` crate; TGA is not content-detectable by `image`. AVIF covers still images only — animated AVIF (`avis` image sequences) and `grid` collages are rejected with an explicit error (the only crate decoding animated AVIF is AGPL-licensed), and AVIF HDR, embedded ICC profiles and the container's `irot`/`imir` orientation are ignored. On Linux, HEIC/HEIF files are reported as unsupported.
 
 ## Examples
 

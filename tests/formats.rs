@@ -7,9 +7,10 @@ const H: u32 = 3;
 
 /// New formats enabled in Cargo.toml whose magic bytes are discoverable by
 /// `with_guessed_format()` (the same decode entry point production uses).
-/// TGA and AVIF are absent: image 0.25's content sniffing cannot detect TGA, and
-/// the stock `avif` feature ships only the ravif *encoder* (its pure-Rust decoder
-/// does not exist; `avif-native`/libdav1d is out of scope).
+/// TGA and AVIF are absent: image 0.25's content sniffing cannot detect TGA,
+/// and AVIF is decoded by `crate::avif` (pure-Rust avif-decode/rav1d) instead
+/// of by the `image` crate, whose `avif` feature ships only the ravif
+/// *encoder*.
 const GUESSABLE: &[ImageFormat] = &[
     ImageFormat::Bmp,
     ImageFormat::Pnm,

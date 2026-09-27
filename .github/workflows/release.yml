@@ -41,6 +41,17 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      # rav1d (the AV1 decoder behind AVIF support) assembles its x86 kernels
+      # with nasm, which neither runner image ships.
+      - name: Install nasm
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install nasm
+          else
+            sudo apt-get update && sudo apt-get install -y nasm
+          fi
+
       - name: Clippy
         run: cargo clippy --target ${{ matrix.target }} -- -D warnings
 

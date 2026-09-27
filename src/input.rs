@@ -102,6 +102,17 @@ fn decode_full(buf: &[u8]) -> Result<(DynamicImage, ColorType), Box<dyn std::err
         let color = img.color();
         return Ok((img, color));
     }
+    // AVIF decodes through `crate::avif` (pure-Rust avif-decode/rav1d) rather
+    // than the `image` crate, so it is routed ahead of the generic reader.
+    if crate::avif::is_avif(buf) {
+        let img = crate::avif::decode(buf, |w, h, bytes| {
+            check_preview_size(w, h)?;
+            check_preview_alloc(w, h, bytes)?;
+            Ok(())
+        })?;
+        let color = img.color();
+        return Ok((img, color));
+    }
     #[cfg(target_os = "macos")]
     if crate::imageio::is_heif(buf) {
         let img = crate::imageio::decode(buf, |w, h| {
@@ -128,8 +139,9 @@ fn decode_full(buf: &[u8]) -> Result<(DynamicImage, ColorType), Box<dyn std::err
 /// Decode for the interactive preview. SVG is rasterized as-is; JPEGs whose
 /// source is much larger than the preview target are downsampled during DCT
 /// decoding (`jpeg-decoder`), avoiding a full-resolution raster and the
-/// resulting peak memory. Everything else, and any JPEG the DCT path declines,
-/// falls through to the regular `image` reader.
+/// resulting peak memory. AVIF goes through `crate::avif`; everything else,
+/// and any JPEG the DCT path declines, falls through to the regular `image`
+/// reader.
 ///
 /// `dpy_scale` is the bitmap display scale (device px per logical point):
 /// when > 1 (Retina Iip/Sixel), every target is computed in point space and
@@ -149,6 +161,15 @@ fn decode_for_preview(
         && let Some(img) = decode_jpeg_scaled(buf, opts, bounds, dpy_scale)?
     {
         return Ok(img);
+    }
+    // Same routing as `decode_full`: AVIF never reaches the `image` reader.
+    if crate::avif::is_avif(buf) {
+        let img = crate::avif::decode(buf, |w, h, bytes| {
+            check_preview_size(w, h)?;
+            check_preview_alloc(w, h, bytes)?;
+            Ok(())
+        })?;
+        return Ok(shrink_to_points(img, dpy_scale, opts, bounds));
     }
     #[cfg(target_os = "macos")]
     if crate::imageio::is_heif(buf) {
@@ -782,6 +803,19 @@ pub fn load_info(source: &Source) -> Result<ImageInfo, Box<dyn std::error::Error
         });
     }
     let m = meta::extract(&buf);
+    // Properties-only read: the container and its AV1 sequence header, no
+    // pixel decode on the `-i` path.
+    if crate::avif::is_avif(&buf) {
+        let a = crate::avif::load_info(&buf)?;
+        return Ok(ImageInfo {
+            size: buf.len() as u64,
+            width: a.width,
+            height: a.height,
+            dpi: None,
+            alpha: a.alpha,
+            color: a.color,
+        });
+    }
     #[cfg(target_os = "macos")]
     if crate::imageio::is_heif(&buf) {
         // Properties-only read: no pixel decode on the `-i` path.

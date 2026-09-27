@@ -2,6 +2,8 @@
 name = "isee"
 version = "0.2.3-dev"
 edition = "2024"
+# avif-decode (the pure-Rust AVIF decoder below) requires 1.98.
+rust-version = "1.98"
 license = "MIT"
 authors = ["Seamile <lanhuermao@gmail.com>"]
 description = "A small tool for previewing images in the terminal."
@@ -31,6 +33,17 @@ resvg = { version = "0.48.1", default-features = false, features = ["text", "sys
 palette   = { version = "0.7.7", default-features = false }
 quantette = { version = "0.6.0", default-features = false }
 
+# AVIF still images decode in pure Rust: avif-parse demuxes the ISOBMFF
+# container (and the AV1 sequence header, which gives the pre-decode size
+# guard its dimensions) while avif-decode drives rav1d, a Rust port of dav1d —
+# no C library, no system dav1d, nothing dynamic to ship. The animation, grid,
+# HDR and ICC corners are unsupported (see `src/avif.rs`).
+# `default-features = false` drops avif-decode's PNG-writing CLI (lodepng);
+# the library itself needs no feature. On x86 targets rav1d's default `asm`
+# feature requires `nasm` at build time (see README).
+avif-decode = { version = "3.0.0", default-features = false }
+avif-parse  = "2.1"
+
 # HEIC decoding rides the system ImageIO/CoreGraphics frameworks on macOS
 # (no libheif, nothing dynamic to ship). Feature sets are kept minimal.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -55,3 +68,13 @@ strip = true
 [profile.dev]
 debug = 1
 codegen-units = 256
+
+# rav1d is a very large AV1 decoder (tens of thousands of lines of Rust plus a
+# large NASM corpus); unoptimized it makes debug test runs crawl. avif-decode's
+# own manifest carries these overrides for its workspace, which do not apply to
+# dependents, so they are repeated here.
+[profile.dev.package.rav1d]
+opt-level = 2
+
+[profile.dev.package.yuv]
+opt-level = 2

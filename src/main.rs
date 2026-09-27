@@ -1,3 +1,4 @@
+mod avif;
 mod b64;
 mod brand;
 mod cli;

@@ -26,7 +26,8 @@ use image::{ColorType, DynamicImage};
 /// HEIC brands: ISOBMFF containers whose `ftyp` major/compatible brand set
 /// intersects this list route to ImageIO. `mif1`/`msf1` are the generic HEIF
 /// brands but are shared with AVIF, so a major-brand `avif` container is
-/// rejected first — only `heic`/`heix`/`hevc`-family majors (or a HEIC major
+/// rejected first — AVIF belongs to `crate::avif` (which `input` checks ahead
+/// of this one); only `heic`/`heix`/`hevc`-family majors (or a HEIC major
 /// with the generic brands merely listed as compatible) enter this path.
 const HEIC_BRANDS: &[&[u8; 4]] = &[
     b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs", b"mif1", b"msf1",
