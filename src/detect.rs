@@ -165,7 +165,8 @@ pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
     // (kitty, Ghostty, WezTerm, iTerm2 — they all render kitty graphics and
     // accept a temp-file transfer by protocol design); default them to
     // tempfile so the skipped probe does not silently cost the
-    // direct-placement speedup. `ISEE_KGP_TRANSFER=stream` still opts out.
+    // direct-placement speedup locally. SSH uses streaming below because
+    // the terminal cannot read files on the remote host.
     //
     // When the probe DID run (`probed_kitty`), its tempfile verdict is
     // authoritative and must win over the brand default. Warp is the one
@@ -185,6 +186,9 @@ pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
     let kgp_transfer = kgp_transfer_choice(
         probed_tempfile,
         env::var("ISEE_KGP_TRANSFER").ok().as_deref(),
+        ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+            .iter()
+            .any(|name| env::var_os(name).is_some()),
     );
 
     let info = TerminalInfo {
@@ -359,15 +363,14 @@ fn enable_tmux_passthrough() {
 }
 
 /// Resolve the KGP payload transport: `ISEE_KGP_TRANSFER` forces a mode
-/// (`tempfile`/`file`, or `stream`), otherwise the tempfile mode rides on the
-/// probe result (the terminal answered OK to a `t=1` query); anything else
-/// streams the payload through the pty.
-fn kgp_transfer_choice(probed_tempfile: bool, forced: Option<&str>) -> KgpTransfer {
+/// (`tempfile`/`file`, or `stream`). Otherwise SSH streams through the pty;
+/// local sessions use the probe result or the recognized brand's default.
+fn kgp_transfer_choice(probed_tempfile: bool, forced: Option<&str>, ssh: bool) -> KgpTransfer {
     let forced = forced.map(|v| v.trim().to_ascii_lowercase());
     match forced.as_deref() {
         Some("tempfile") | Some("file") => KgpTransfer::Tempfile,
         Some("stream") => KgpTransfer::Stream,
-        _ if probed_tempfile => KgpTransfer::Tempfile,
+        _ if probed_tempfile && !ssh => KgpTransfer::Tempfile,
         _ => KgpTransfer::Stream,
     }
 }
@@ -964,33 +967,54 @@ mod tests {
 
     #[test]
     fn kgp_transfer_choice_prefers_probe_by_default() {
-        assert_eq!(kgp_transfer_choice(true, None), KgpTransfer::Tempfile);
-        assert_eq!(kgp_transfer_choice(false, None), KgpTransfer::Stream);
+        assert_eq!(
+            kgp_transfer_choice(true, None, false),
+            KgpTransfer::Tempfile
+        );
+        assert_eq!(kgp_transfer_choice(false, None, false), KgpTransfer::Stream);
+    }
+
+    #[test]
+    fn kgp_transfer_choice_streams_over_ssh() {
+        // A known brand can support files without sharing the remote filesystem.
+        assert_eq!(kgp_transfer_choice(true, None, true), KgpTransfer::Stream);
+        assert_eq!(kgp_transfer_choice(false, None, true), KgpTransfer::Stream);
+        assert_eq!(
+            kgp_transfer_choice(true, Some("???"), true),
+            KgpTransfer::Stream
+        );
+        assert_eq!(
+            kgp_transfer_choice(true, Some("tempfile"), true),
+            KgpTransfer::Tempfile
+        );
     }
 
     #[test]
     fn kgp_transfer_choice_env_overrides_probe() {
         assert_eq!(
-            kgp_transfer_choice(false, Some("tempfile")),
+            kgp_transfer_choice(false, Some("tempfile"), false),
             KgpTransfer::Tempfile
         );
         assert_eq!(
-            kgp_transfer_choice(false, Some("FILE")),
+            kgp_transfer_choice(false, Some("FILE"), false),
             KgpTransfer::Tempfile
         );
         assert_eq!(
-            kgp_transfer_choice(true, Some("stream")),
+            kgp_transfer_choice(true, Some("stream"), false),
             KgpTransfer::Stream
         );
         // Unknown values fall through to the probe result.
         assert_eq!(
-            kgp_transfer_choice(true, Some("???")),
+            kgp_transfer_choice(true, Some("???"), false),
             KgpTransfer::Tempfile
         );
-        assert_eq!(kgp_transfer_choice(false, Some("???")), KgpTransfer::Stream);
+        assert_eq!(
+            kgp_transfer_choice(false, Some("???"), false),
+            KgpTransfer::Stream
+        );
         // Whitespace around the value is trimmed.
         assert_eq!(
-            kgp_transfer_choice(false, Some(" tempfile ")),
+            kgp_transfer_choice(false, Some(" tempfile "), false),
             KgpTransfer::Tempfile
         );
     }
