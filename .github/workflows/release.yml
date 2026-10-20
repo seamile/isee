@@ -53,13 +53,13 @@ jobs:
           fi
 
       - name: Clippy
-        run: cargo clippy --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --locked --target ${{ matrix.target }} -- -D warnings
 
       - name: Test
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --locked --release --target ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package (POSIX)
         run: |
@@ -84,7 +84,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install nasm
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
-        run: cargo publish
+        run: cargo publish --locked
