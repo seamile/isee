@@ -24,6 +24,8 @@ jobs:
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - name: Checkout code
@@ -41,8 +43,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # rav1d (the AV1 decoder behind AVIF support) assembles its x86 kernels
-      # with nasm, which neither runner image ships.
+      # with nasm, which neither Unix runner image ships.
       - name: Install nasm
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then

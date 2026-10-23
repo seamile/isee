@@ -15,8 +15,13 @@ mod sixel;
 mod size;
 
 use std::fmt;
+#[cfg(windows)]
+use std::io::IsTerminal;
 use std::io::{self, Write};
-use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::process::ExitCode;
 
 use detect::Protocol;
@@ -64,6 +69,7 @@ enum AppErr {
 /// image) leaves the terminal waiting for the rest, so the following shell
 /// prompt is swallowed as payload. Before dying we write CAN (`0x18`) +
 /// ST (`ESC \`), which closes any half-open APC/DCS/OSC immediately.
+#[cfg(unix)]
 extern "C" fn fast_exit_handler(_: libc::c_int) {
     // write(2)/signal(2)/raise(2) are async-signal-safe; write into the raw
     // fd instead of the Rust stdout handle (non-reentrant, may hold a lock).
@@ -77,6 +83,7 @@ extern "C" fn fast_exit_handler(_: libc::c_int) {
     }
 }
 
+#[cfg(unix)]
 fn install_fast_exit() {
     // Reroute SIGINT from default-die to the repair-then-die handler.
     unsafe {
@@ -96,6 +103,9 @@ fn install_fast_exit() {
         libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
     }
 }
+
+#[cfg(windows)]
+fn install_fast_exit() {}
 
 impl fmt::Display for AppErr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -120,7 +130,11 @@ fn run(args: &cli::Args) -> Result<(), AppErr> {
 /// mixed with stdin.
 fn build_sources(args: &cli::Args) -> Result<Vec<input::Source>, AppErr> {
     if args.paths.is_empty() {
-        if detect::is_tty(0) {
+        #[cfg(unix)]
+        let stdin_is_tty = detect::is_tty(0);
+        #[cfg(windows)]
+        let stdin_is_tty = std::io::stdin().is_terminal();
+        if stdin_is_tty {
             return Err(AppErr::Usage(
                 "no image path and stdin is a terminal".into(),
             ));
@@ -180,7 +194,10 @@ fn run_preview(
     stdout: &io::Stdout,
 ) -> Result<(), AppErr> {
     let multi = sources.len() > 1;
+    #[cfg(unix)]
     let term = detect::detect(stdout.as_raw_fd(), args.protocol);
+    #[cfg(windows)]
+    let term = detect::detect(stdout.as_raw_handle(), args.protocol);
     let opts = size::RenderOpts {
         width: args.width,
         quality: args.quality,

@@ -22,7 +22,7 @@ Detection reads the environment's brand table; terminals it does not know are pr
 - **Sixel**: Foot, Konsole, Windows Terminal, BlackBox
 - **Half Blocks**: Hyper — it supports no bitmap protocol at all
 
-> **Platform support** — `isee` is currently built and tested on Linux and macOS. Windows is not yet supported.
+> **Platform support** — `isee` supports Linux, macOS, and Windows. The author primarily develops on Linux and macOS, so Windows receives less testing.
 
 ## Installation
 

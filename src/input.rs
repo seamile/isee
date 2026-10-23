@@ -473,6 +473,13 @@ fn core_font_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
+#[cfg(windows)]
+fn core_font_dirs() -> Vec<std::path::PathBuf> {
+    std::env::var_os("WINDIR")
+        .map(|windir| vec![std::path::PathBuf::from(windir).join("Fonts")])
+        .unwrap_or_default()
+}
+
 /// Reject an SVG whose rasterized pixel area exceeds `SVG_MAX_PIXELS`, using
 /// overflow-safe multiplication so a pathological declared size cannot wrap.
 /// The `resvg` pixmap allocation is outside `image::Limits`, so this must run

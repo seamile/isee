@@ -1,7 +1,13 @@
 use std::env;
+#[cfg(unix)]
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::RawHandle;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use crate::size::KgpTransfer;
@@ -57,19 +63,28 @@ pub struct TerminalInfo {
     pub kgp_transfer: KgpTransfer,
 }
 
+#[cfg(unix)]
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(unix)]
 const KGP_PROBE: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
+#[cfg(unix)]
 const CSI_CELL_PX: &[u8] = b"\x1b[16t";
+#[cfg(unix)]
 const OSC_CELL_SIZE: &[u8] = b"\x1b]1337;ReportCellSize\x1b\\";
+#[cfg(unix)]
 const XTVERSION_Q: &[u8] = b"\x1b[>q";
+#[cfg(unix)]
 const DA1_Q: &[u8] = b"\x1b[0c";
+#[cfg(unix)]
 const MAX_RESPONSE: usize = 4096;
 
-pub fn is_tty(fd: i32) -> bool {
+#[cfg(unix)]
+pub fn is_tty(fd: RawFd) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
-pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
+#[cfg(unix)]
+pub fn detect(stdout_fd: RawFd, forced: Option<Protocol>) -> TerminalInfo {
     let tmux = in_tmux();
     let stdout_tty = is_tty(stdout_fd);
     let override_p = isee_override();
@@ -222,6 +237,41 @@ pub fn detect(stdout_fd: i32, forced: Option<Protocol>) -> TerminalInfo {
     info
 }
 
+#[cfg(windows)]
+pub fn detect(_: RawHandle, forced: Option<Protocol>) -> TerminalInfo {
+    let brand = crate::brand::detect(|name| env::var(name).ok());
+    let protocol = select_windows_protocol(forced, isee_override(), brand, env_kitty_hint());
+    TerminalInfo {
+        protocol,
+        cell: fallback_cell(),
+        win: WinSize {
+            cols: 80,
+            rows: 24,
+            px: None,
+        },
+        tmux: false,
+        dpy_scale: 1,
+        probed_scale: None,
+        brand,
+        forced: forced.is_some(),
+        kgp_transfer: KgpTransfer::default(),
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn select_windows_protocol(
+    forced: Option<Protocol>,
+    override_p: Option<Protocol>,
+    brand: Option<crate::brand::Brand>,
+    env_kitty: bool,
+) -> Protocol {
+    forced
+        .or(override_p)
+        .or_else(|| brand.and_then(crate::brand::preferred_protocol))
+        .or_else(|| env_kitty.then_some(Protocol::Kitty))
+        .unwrap_or(Protocol::HalfBlocks)
+}
+
 /// Protocol priority: `-p` > `ISEE_PROTOCOL` > brand table (env- or
 /// XTVERSION-derived; measured support matrix, KGP-first) > probed KGP /
 /// kitty env hint > probed DA1 sixel > Half Blocks. The brand table wins over
@@ -322,7 +372,8 @@ fn fallback_cell() -> CellPx {
     }
 }
 
-fn win_size(fd: i32) -> WinSize {
+#[cfg(unix)]
+fn win_size(fd: RawFd) -> WinSize {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
@@ -343,6 +394,15 @@ fn win_size(fd: i32) -> WinSize {
                 px: None,
             }
         }
+    }
+}
+
+#[cfg(windows)]
+fn win_size(_: RawHandle) -> WinSize {
+    WinSize {
+        cols: 80,
+        rows: 24,
+        px: None,
     }
 }
 
@@ -670,7 +730,8 @@ fn dbg_dump(label: &str, buf: &[u8]) {
 
 /// Wait until `fd` is readable using select(2).
 /// macOS poll(2) reports POLLNVAL for /dev/tty, so poll is unusable here.
-fn wait_readable(fd: i32, timeout_ms: i32) -> bool {
+#[cfg(unix)]
+fn wait_readable(fd: RawFd, timeout_ms: i32) -> bool {
     if fd < 0 || fd >= libc::FD_SETSIZE as i32 {
         return false;
     }
@@ -695,6 +756,7 @@ fn wait_readable(fd: i32, timeout_ms: i32) -> bool {
 
 /// Read from `tty` until `term` appears. Bytes read past `term` (e.g. the
 /// response to the next probe arriving early) are kept in `tty.pending`.
+#[cfg(unix)]
 fn read_until(tty: &mut RawTty, term: &[u8], timeout: Duration) -> ProbeRead {
     if let Some(pos) = find_sub(&tty.pending, term) {
         let rest = tty.pending.split_off(pos + term.len());
@@ -735,7 +797,8 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn drain_input(fd: i32) {
+#[cfg(unix)]
+fn drain_input(fd: RawFd) {
     let mut tmp = [0u8; 256];
     loop {
         let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
@@ -745,6 +808,7 @@ fn drain_input(fd: i32) {
     }
 }
 
+#[cfg(unix)]
 struct RawTty {
     file: File,
     orig: libc::termios,
@@ -752,6 +816,7 @@ struct RawTty {
     pending: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl RawTty {
     fn new() -> Option<Self> {
         let file = OpenOptions::new()
@@ -780,6 +845,7 @@ impl RawTty {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawTty {
     fn drop(&mut self) {
         if self.raw {
@@ -859,6 +925,30 @@ pub fn wrap_graphics_passthrough(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_protocol_selection_falls_back_after_brand_and_kitty() {
+        assert_eq!(
+            select_windows_protocol(None, None, Some(crate::brand::Brand::Microsoft), false),
+            Protocol::Sixel
+        );
+        assert_eq!(
+            select_windows_protocol(None, None, Some(crate::brand::Brand::WezTerm), false),
+            Protocol::Kitty
+        );
+        assert_eq!(
+            select_windows_protocol(None, None, Some(crate::brand::Brand::Mintty), false),
+            Protocol::Iip
+        );
+        assert_eq!(
+            select_windows_protocol(None, None, None, true),
+            Protocol::Kitty
+        );
+        assert_eq!(
+            select_windows_protocol(None, None, None, false),
+            Protocol::HalfBlocks
+        );
+    }
 
     #[test]
     fn csi_t_parse() {
