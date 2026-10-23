@@ -86,6 +86,7 @@ pub fn detect(lookup: impl Fn(&str) -> Option<String>) -> Option<Brand> {
 /// mirroring yazi's `Brand::from_csi` substring table. Multiplexer names
 /// (tmux/Zellij/libvterm) deliberately map to None: they name no bitmap
 /// terminal, and the env table keeps covering those.
+#[cfg(any(unix, test))]
 pub fn from_version_str(resp: &str) -> Option<Brand> {
     let names = [
         ("kitty", Brand::KittyFamily),

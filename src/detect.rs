@@ -50,6 +50,7 @@ pub struct TerminalInfo {
     /// Device pixels per logical point as probed from the terminal itself
     /// (iTerm2's OSC 1337 ReportCellSize is the only known source).
     /// Informational for now: rendering still keys off `dpy_scale`.
+    #[cfg_attr(windows, allow(dead_code))]
     pub probed_scale: Option<f32>,
     /// Env-recognized terminal brand (see `brand::detect`); gates
     /// brand-specific behavior such as the Iip GIF-animation whitelist.
@@ -254,7 +255,7 @@ pub fn detect(_: RawHandle, forced: Option<Protocol>) -> TerminalInfo {
         probed_scale: None,
         brand,
         forced: forced.is_some(),
-        kgp_transfer: KgpTransfer::default(),
+        kgp_transfer: KgpTransfer::Stream,
     }
 }
 
@@ -279,6 +280,7 @@ fn select_windows_protocol(
 /// (`want_kgp`); unknown brands still ride the probe. Sixel inside tmux is
 /// downgraded to Half Blocks unless it was forced with `-p sixel` — forced
 /// sixel rides the DCS passthrough wrapper instead.
+#[cfg(any(unix, test))]
 fn select_protocol(
     forced: Option<Protocol>,
     override_p: Option<Protocol>,
@@ -305,6 +307,7 @@ fn select_protocol(
     protocol
 }
 
+#[cfg(unix)]
 fn in_tmux() -> bool {
     env::var("TMUX").is_ok() || env::var("TERM_PROGRAM").is_ok_and(|v| v == "tmux")
 }
@@ -323,6 +326,7 @@ fn isee_override() -> Option<Protocol> {
 
 /// `ISEE_DPI_SCALE=1|2` forces the bitmap display scale; unset, "auto", or
 /// any other value keeps the default 1 (native-px, imgcat-matching).
+#[cfg(unix)]
 fn isee_dpi_scale() -> Option<u32> {
     match env::var("ISEE_DPI_SCALE").ok()?.trim() {
         "1" => Some(1),
@@ -397,18 +401,10 @@ fn win_size(fd: RawFd) -> WinSize {
     }
 }
 
-#[cfg(windows)]
-fn win_size(_: RawHandle) -> WinSize {
-    WinSize {
-        cols: 80,
-        rows: 24,
-        px: None,
-    }
-}
-
 /// Let this pane's DCS passthrough sequences reach the outer terminal and
 /// survive the trip: tmux caps input buffers small by default, which
 /// truncates large passthrough image transfers (mirrors yazi's tmux_setup()).
+#[cfg(unix)]
 fn enable_tmux_passthrough() {
     use std::process::{Command, Stdio};
     let quiet = |cmd: &mut Command| {
@@ -425,6 +421,7 @@ fn enable_tmux_passthrough() {
 /// Resolve the KGP payload transport: `ISEE_KGP_TRANSFER` forces a mode
 /// (`tempfile`/`file`, or `stream`). Otherwise SSH streams through the pty;
 /// local sessions use the probe result or the recognized brand's default.
+#[cfg(any(unix, test))]
 fn kgp_transfer_choice(probed_tempfile: bool, forced: Option<&str>, ssh: bool) -> KgpTransfer {
     let forced = forced.map(|v| v.trim().to_ascii_lowercase());
     match forced.as_deref() {
@@ -435,10 +432,12 @@ fn kgp_transfer_choice(probed_tempfile: bool, forced: Option<&str>, ssh: bool) -
     }
 }
 
+#[cfg(unix)]
 fn write_probe(tty: &mut RawTty, seq: &[u8], passthrough: bool) -> bool {
     tty.file.write_all(&probe_bytes(seq, passthrough)).is_ok()
 }
 
+#[cfg(unix)]
 fn probe_bytes(seq: &[u8], passthrough: bool) -> Vec<u8> {
     if passthrough {
         wrap_passthrough(seq)
@@ -455,6 +454,7 @@ fn probe_bytes(seq: &[u8], passthrough: bool) -> Vec<u8> {
 /// the two KGP queries (`t=d` streaming, `t=t` tempfile) when the kitty
 /// protocol is still a candidate. All responses share one deadline; each
 /// `read_until(ST)` chunk is classified as it arrives.
+#[cfg(any(unix, test))]
 #[derive(Default)]
 struct ProbeAnswers {
     kgp: bool,
@@ -463,6 +463,7 @@ struct ProbeAnswers {
     brand: Option<crate::brand::Brand>,
 }
 
+#[cfg(unix)]
 fn probe_batch(tty: &mut RawTty, passthrough: bool, want_kgp: bool) -> ProbeAnswers {
     let mut batch = Vec::with_capacity(256);
     batch.extend_from_slice(b"\x1b7"); // DECSC: save cursor
@@ -517,6 +518,7 @@ fn probe_batch(tty: &mut RawTty, passthrough: bool, want_kgp: bool) -> ProbeAnsw
 /// Have all expected answers been seen in `chunks`? The DA1 reply carries no
 /// ST terminator, so it usually shows up either merged into an ST-terminated
 /// chunk or in the Timeout leftover.
+#[cfg(any(unix, test))]
 fn batch_resolved(chunks: &[String], want_kgp: bool, want_file: bool) -> bool {
     let version = chunks.iter().any(|s| s.contains(">|"));
     let da1 = chunks.iter().any(|s| da1_attrs(s).is_some());
@@ -524,6 +526,7 @@ fn batch_resolved(chunks: &[String], want_kgp: bool, want_file: bool) -> bool {
     version && da1 && kgp_resolved_ids(chunks, want_file) >= want
 }
 
+#[cfg(any(unix, test))]
 fn classify_batch(chunks: &[String]) -> ProbeAnswers {
     let mut a = ProbeAnswers::default();
     for s in chunks {
@@ -554,6 +557,7 @@ fn classify_batch(chunks: &[String]) -> ProbeAnswers {
 /// `tty-graphics-protocol` marker so kitty deletes it after reading; we also
 /// unlink it ourselves in case that cleanup does not run.
 /// Returns the query bytes plus the temp file path when one was created.
+#[cfg(unix)]
 fn kgp_queries(passthrough: bool) -> (Vec<u8>, Option<std::path::PathBuf>) {
     let probe_file = std::env::temp_dir().join(format!(
         "kitty-tty-graphics-protocol-isee-probe-{}",
@@ -574,6 +578,7 @@ fn kgp_queries(passthrough: bool) -> (Vec<u8>, Option<std::path::PathBuf>) {
 /// How many of the wanted probe ids (i=31 streaming, i=32 tempfile) have
 /// been resolved by `chunks`? Unrecognized chunks are ignored and the read
 /// loop keeps going until the shared deadline.
+#[cfg(any(unix, test))]
 fn kgp_resolved_ids(chunks: &[String], want_file: bool) -> usize {
     let mut n = usize::from(chunks.iter().any(|s| s.contains("i=31")));
     if want_file && chunks.iter().any(|s| s.contains("i=32")) {
@@ -582,6 +587,7 @@ fn kgp_resolved_ids(chunks: &[String], want_file: bool) -> usize {
     n
 }
 
+#[cfg(unix)]
 fn base64_encode_path(path: &std::path::Path) -> String {
     crate::b64::base64_encode(path.to_string_lossy().as_bytes())
 }
@@ -589,6 +595,7 @@ fn base64_encode_path(path: &std::path::Path) -> String {
 /// Classify the collected probe responses into `(streaming_ok, tempfile_ok)`.
 /// Kitty echoes the request id on both OK and ERR responses, so one
 /// contains() check per response segment resolves either outcome.
+#[cfg(any(unix, test))]
 fn kgp_probe_verdicts(chunks: &[impl AsRef<str>]) -> (bool, bool) {
     chunks.iter().fold((false, false), |(d, f), s| {
         let s = s.as_ref();
@@ -607,6 +614,7 @@ fn kgp_probe_verdicts(chunks: &[impl AsRef<str>]) -> (bool, bool) {
     })
 }
 
+#[cfg(unix)]
 fn probe_cell_px(tty: &mut RawTty, passthrough: bool) -> Option<CellPx> {
     if !write_probe(tty, CSI_CELL_PX, passthrough) {
         return None;
@@ -626,6 +634,7 @@ fn probe_cell_px(tty: &mut RawTty, passthrough: bool) -> Option<CellPx> {
 
 /// iTerm2's OSC 1337 cell-size query. The reply carries the cell in logical
 /// points plus the display scale, which also makes it a scale probe.
+#[cfg(unix)]
 fn probe_report_cell_size(tty: &mut RawTty, passthrough: bool) -> Option<(CellPx, f32)> {
     if !write_probe(tty, OSC_CELL_SIZE, passthrough) {
         return None;
@@ -647,6 +656,7 @@ fn probe_report_cell_size(tty: &mut RawTty, passthrough: bool) -> Option<(CellPx
 /// BEL-terminated variant). Order is HEIGHT first, values are floats;
 /// verified against iTerm2 on a 2x display: `=16.0;7.0;2.0` with the
 /// window report cross-checking 7x16 pt * 2 = 14x32 device px.
+#[cfg(any(unix, test))]
 fn parse_report_cell_size(raw: &[u8]) -> Option<(CellPx, f32)> {
     let s = std::str::from_utf8(raw).ok()?;
     let idx = s.find("ReportCellSize=")?;
@@ -673,6 +683,7 @@ fn parse_report_cell_size(raw: &[u8]) -> Option<(CellPx, f32)> {
 /// Parse a DA1 reply: `CSI ? Ps ; ... c` (e.g. `\x1b[?62;4;6c`). Attribute
 /// 4 means Sixel graphics. Returns None when the chunk carries no DA1 reply
 /// or a malformed one.
+#[cfg(any(unix, test))]
 fn da1_attrs(chunk: &str) -> Option<Vec<u16>> {
     let start = chunk.find("\x1b[?")? + "\x1b[?".len();
     let end = chunk[start..].find('c')?;
@@ -686,6 +697,7 @@ fn da1_attrs(chunk: &str) -> Option<Vec<u16>> {
 /// Extract the name from an XTVERSION reply: `DCS > | name ST` (e.g.
 /// `\x1bP>|kitty(0.42.2)\x1b\\`), tolerating a BEL terminator and a reply
 /// without terminator (Timeout leftover).
+#[cfg(any(unix, test))]
 fn xtversion_name(chunk: &str) -> Option<&str> {
     let start = chunk.find(">|")? + 2;
     let rest = &chunk[start..];
@@ -694,6 +706,7 @@ fn xtversion_name(chunk: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
+#[cfg(any(unix, test))]
 fn parse_csi_t(raw: &[u8]) -> Option<CellPx> {
     let s = std::str::from_utf8(raw).ok()?;
     let idx = s.rfind('\x1b')?;
@@ -713,11 +726,13 @@ fn parse_csi_t(raw: &[u8]) -> Option<CellPx> {
     }
 }
 
+#[cfg(unix)]
 enum ProbeRead {
     Found(Vec<u8>),
     Timeout(Vec<u8>),
 }
 
+#[cfg(unix)]
 fn dbg_dump(label: &str, buf: &[u8]) {
     if env::var("ISEE_DEBUG").is_ok() {
         eprintln!(
