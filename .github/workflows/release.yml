@@ -4,14 +4,31 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to receive the asset
+        required: true
+        type: string
+      target:
+        description: Target to build
+        required: true
+        default: x86_64-pc-windows-msvc
+        type: choice
+        options:
+          - x86_64-pc-windows-msvc
+          - x86_64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  build-unix:
     name: Build - ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    if: github.event_name == 'push' || inputs.target != 'x86_64-pc-windows-msvc'
     strategy:
       matrix:
         include:
@@ -27,10 +44,11 @@ jobs:
             target: aarch64-apple-darwin
             artifact_name: isee
             asset_name: isee-macos-aarch64.tgz
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -61,21 +79,77 @@ jobs:
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Package (POSIX)
+      - name: Package
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
+
+      - name: Verify release exists
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "${{ inputs.release_tag }}" --repo "${{ github.repository }}" >/dev/null
 
       - name: Upload Artifacts
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.asset_name }}
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-windows:
+    name: Build - x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    if: github.event_name == 'push' || inputs.target == 'x86_64-pc-windows-msvc'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.sha }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --locked --target x86_64-pc-windows-msvc -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path target/x86_64-pc-windows-msvc/release/isee.exe -DestinationPath isee-windows-x86_64.zip
+
+      - name: Verify release exists
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "${{ inputs.release_tag }}" --repo "${{ github.repository }}" >/dev/null
+
+      - name: Upload Artifacts
+        uses: softprops/action-gh-release@v3
+        with:
+          files: isee-windows-x86_64.zip
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish:
     name: Publish to Crates.io
-    needs: build
+    needs: [build-unix, build-windows]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
