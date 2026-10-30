@@ -1,9 +1,13 @@
-# iSee
+<p align="center">
+  <img src="assets/logo.png" width="200" alt="iSee logo">
+</p>
 
-[![CI](https://img.shields.io/github/actions/workflow/status/seamile/isee/check.yml?branch=main&label=CI)](https://github.com/seamile/isee/actions/workflows/check.yml)
-[![Crates.io](https://img.shields.io/crates/v/isee)](https://crates.io/crates/isee)
-[![Downloads](https://img.shields.io/crates/d/isee)](https://crates.io/crates/isee)
-[![License](https://img.shields.io/crates/l/isee)](LICENSE)
+<p align="center">
+  <a href="https://github.com/seamile/isee/actions/workflows/check.yml"><img src="https://img.shields.io/github/actions/workflow/status/seamile/isee/check.yml?branch=main&label=CI" alt="CI"></a>
+  <a href="https://crates.io/crates/isee"><img src="https://img.shields.io/crates/v/isee" alt="Crates.io"></a>
+  <a href="https://crates.io/crates/isee"><img src="https://img.shields.io/crates/d/isee" alt="Downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/crates/l/isee" alt="License"></a>
+</p>
 
 An image viewer for the terminal, simple and fast.
 
