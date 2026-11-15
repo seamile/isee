@@ -1,0 +1,4 @@
+[env]
+# NASM 3.02+ writes the platform metadata missing from rav1d's Mach-O objects.
+# The macho pragma is ignored for other object formats.
+NASMENV = "!--pragma!macho build_version macos,10,12"

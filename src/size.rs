@@ -154,6 +154,7 @@ pub enum KgpTransfer {
     Tempfile,
 }
 
+#[derive(Clone)]
 pub struct RenderOpts {
     pub width: Option<u32>,
     pub quality: Quality,

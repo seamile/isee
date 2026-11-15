@@ -27,7 +27,7 @@ Or download a prebuilt binary from the [releases page](https://github.com/seamil
 
 Building from source requires Rust 1.98 or newer. On x86_64, it also requires `nasm` to assemble the AV1 decoder's kernels for AVIF support. Install it with `apt install nasm` on Debian or Ubuntu, or `brew install nasm` on macOS. Prebuilt binaries need neither Rust nor `nasm`.
 
-On Intel macOS, Xcode 15's linker prints `no platform load command found in … assuming: macOS` once per object nasm produces. That warning is expected and harmless — nasm does not record a platform, macOS is correctly assumed, and any nasm-based project emits the same noise ([nasm bug 3392928](https://bugzilla.nasm.us/show_bug.cgi?id=3392928)).
+On Intel macOS, use NASM 3.02 or newer. This checkout's Cargo configuration adds the macOS platform metadata to the AV1 decoder's assembly objects, avoiding the linker's `no platform load command found` warning. Older NASM versions still build but cannot add that metadata. When installing outside this checkout, use `NASMENV='!--pragma!macho build_version macos,10,12' cargo install isee`. If upgrading an existing build, run `cargo clean -p rav1d` once so its cached assembly objects are rebuilt.
 
 ## Usage
 
@@ -45,6 +45,9 @@ isee /foo/bar/image.jpg
 
 # Preview with width 800px
 isee -w 800 /foo/bar/image.jpg
+
+# Tile three images per row
+isee -t 3 *.jpg
 
 # Force a protocol when detection cannot identify the terminal
 isee -p sixel /foo/bar/image.jpg
@@ -67,6 +70,7 @@ cat /foo/bar/image.jpg | isee
 ### Options
 
 - `-w WIDTH`: Preview at the given pixel width (e.g. `-w 800` for 800px); `-w 0` uses the image's native width
+- `-t COUNT`: Tile images in COUNT columns (also accepts `-t3`); COUNT must be positive. Ignores `-w` and `-a` with a warning
 - `-q QUALITY`: Preview scaling quality: `L` (nearest, fastest), `M` (triangle, default), `H` (lanczos, sharpest)
 - `-p PROTOCOL`: Force the preview protocol: `auto` (default), `kitty`, `iip`, `sixel`, or `halfblock` — for terminals whose environment does not identify them (e.g. over ssh)
 - `-i`: Show image information (size, dimensions, DPI, colorspace, alpha)
@@ -75,6 +79,8 @@ cat /foo/bar/image.jpg | isee
 - `-h, --help`: Print help
 
 Without `-w`, the terminal window width is the only width cap. A preview is never wider than the terminal window; with `-w` it may be TALLER than the window — graphics scroll with the text. Only the protocol's hard ceiling (the tmux kitty placeholder grid) and a 12000 px/side resource guard apply to height.
+
+With `-t`, the terminal's usable content width (or tmux pane width) is split into square image areas. One terminal-character column is reserved between neighboring areas, so the exact pixel size depends on the terminal cell width; any remainder stays on the right. Areas align to whole terminal columns. Images scale up or down to fit, preserving aspect ratio, and align to the top-left corner without cropping. Each area has its original input path on a separate text line above it; long paths are shortened with `…`. Titles are shown even for a single image (`-` for stdin). Animated images show their first frame. Rows scroll vertically, and an incomplete last row keeps its empty slots. Failed images also keep their slots while later images continue; failures are reported on stderr and produce a nonzero exit status. Excessive column counts are limited to the terminal's capacity with a warning; protocol and preview memory limits still apply. `-i` takes precedence and continues to show image information.
 
 ## Compatibility
 

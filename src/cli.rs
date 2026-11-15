@@ -7,6 +7,7 @@ use crate::size::Quality;
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Args {
     pub width: Option<u32>,
+    pub tile: Option<u32>,
     pub quality: Quality,
     pub info: bool,
     pub animate: bool,
@@ -55,6 +56,8 @@ Options:
              Without -w, the terminal window width is the only cap. A
              preview is never wider than the terminal window; its height
              may exceed the window (the terminal scrolls vertically).
+  -t COUNT   Tile COUNT images per row in square areas; scale to fit,
+             keeping aspect ratio. Ignores -w and -a.
   -q QUALITY Preview scaling quality: L (nearest), M (triangle), H (lanczos);
              default M
   -p PROTO   Specify the preview protocol: auto (default),
@@ -78,6 +81,10 @@ where
             out.width = Some(parse_num("-w", v)?);
             continue;
         }
+        if let Some(v) = short_value("-t", &arg) {
+            out.tile = Some(parse_tile(v)?);
+            continue;
+        }
         if let Some(v) = short_value("-q", &arg) {
             out.quality = parse_quality(v)?;
             continue;
@@ -94,6 +101,10 @@ where
             "-w" => {
                 let v = it.next().ok_or(ParseError::MissingValue("-w"))?;
                 out.width = Some(parse_num("-w", &v)?);
+            }
+            "-t" => {
+                let v = it.next().ok_or(ParseError::MissingValue("-t"))?;
+                out.tile = Some(parse_tile(&v)?);
             }
             "-q" => {
                 let v = it.next().ok_or(ParseError::MissingValue("-q"))?;
@@ -123,6 +134,14 @@ fn parse_num(opt: &'static str, v: &str) -> Result<u32, ParseError> {
         .map_err(|_| ParseError::InvalidNumber(opt, v.to_string()))
 }
 
+fn parse_tile(v: &str) -> Result<u32, ParseError> {
+    let count = parse_num("-t", v)?;
+    if count == 0 {
+        return Err(ParseError::InvalidNumber("-t", v.to_string()));
+    }
+    Ok(count)
+}
+
 fn parse_quality(v: &str) -> Result<Quality, ParseError> {
     Quality::parse(v).ok_or_else(|| ParseError::InvalidQuality(v.trim().to_string()))
 }
@@ -143,6 +162,41 @@ fn parse_protocol(v: &str) -> Result<Option<Protocol>, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_tile_count_and_ignored_options_in_either_order() {
+        assert_eq!(parse(["-t", "3"]).unwrap().tile, Some(3));
+        assert_eq!(parse(["-t3"]).unwrap().tile, Some(3));
+        for args in [
+            ["-t3", "-w800", "-a", "a.png"],
+            ["-a", "-w800", "-t3", "a.png"],
+        ] {
+            let a = parse(args).unwrap();
+            assert_eq!(a.tile, Some(3));
+            assert_eq!(a.width, Some(800));
+            assert!(a.animate);
+            assert_eq!(a.paths, vec![PathBuf::from("a.png")]);
+        }
+    }
+
+    #[test]
+    fn parse_tile_rejects_invalid_counts_and_long_option() {
+        assert!(matches!(parse(["-t"]), Err(ParseError::MissingValue("-t"))));
+        for value in ["0", "-1", "abc", "4294967296"] {
+            assert!(matches!(
+                parse(["-t", value]),
+                Err(ParseError::InvalidNumber("-t", _))
+            ));
+        }
+        assert!(matches!(
+            parse(["-t0"]),
+            Err(ParseError::InvalidNumber("-t", _))
+        ));
+        assert!(matches!(
+            parse(["--tile", "3"]),
+            Err(ParseError::UnknownOption(_))
+        ));
+    }
 
     #[test]
     fn parse_basic_info() {

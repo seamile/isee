@@ -15,13 +15,26 @@ pub fn render(img: &DynamicImage, o: &RenderOpts) -> String {
             .into_rgba8()
     };
 
+    encode_grid(&rgba, cells_w, cells_h, false)
+}
+
+/// Render an already sampled grid, with two pixel rows per terminal row.
+pub fn render_grid(rgba: &RgbaImage) -> String {
+    encode_grid(rgba, rgba.width(), rgba.height() / 2, true)
+}
+
+fn encode_grid(rgba: &RgbaImage, cells_w: u32, cells_h: u32, blank_transparent: bool) -> String {
     let mut out =
         String::with_capacity(cells_w as usize * cells_h as usize * 40 + cells_h as usize);
     use std::fmt::Write as _;
     for cy in 0..cells_h {
         for cx in 0..cells_w {
-            let top = pixel(&rgba, cx, cy * 2);
-            let bot = pixel(&rgba, cx, cy * 2 + 1);
+            let top = pixel(rgba, cx, cy * 2);
+            let bot = pixel(rgba, cx, cy * 2 + 1);
+            if blank_transparent && top.3 == 0 && bot.3 == 0 {
+                out.push_str("\x1b[0m ");
+                continue;
+            }
             let (tr, tg, tb) = blend(top);
             let (br, bg, bb) = blend(bot);
             write!(
@@ -66,6 +79,15 @@ mod tests {
     #[test]
     fn blend_transparent() {
         assert_eq!(blend((10, 20, 30, 0)), (0, 0, 0));
+    }
+
+    #[test]
+    fn sampled_grid_resets_background_before_transparent_cells() {
+        let rgba = RgbaImage::from_fn(3, 2, |x, _| {
+            image::Rgba(if x == 1 { [0; 4] } else { [255, 0, 0, 255] })
+        });
+        let red = "\x1b[38;2;255;0;0m\x1b[48;2;255;0;0m▀";
+        assert_eq!(render_grid(&rgba), format!("{red}\x1b[0m {red}\x1b[0m\n"));
     }
 
     #[test]
@@ -130,7 +152,11 @@ mod tests {
         // 18x36 px at cell 9x18 targets cells_w=2, px_h=4 (resize branch:
         // grid != source dims). Output is 2 rows of 2 half-blocks, each row
         // reset and terminated with LF.
-        let img = DynamicImage::new_rgba8(18, 36);
+        let img = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            18,
+            36,
+            image::Rgba([255, 255, 255, 255]),
+        ));
         let out = render(&img, &opts());
         let lines: Vec<&str> = out.split('\n').filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 2, "two cell rows, got {out:?}");
@@ -155,7 +181,11 @@ mod tests {
         // the placeholder/character grid lands exactly on 80 cols x 48 rows
         // and can never wrap past the window edge.
         let o = opts(); // 80x24 cells, halfblock bounds 720x864
-        let img = DynamicImage::new_rgba8(1440, 1728);
+        let img = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            1440,
+            1728,
+            image::Rgba([255, 255, 255, 255]),
+        ));
         let out = render(&img, &o);
         let lines: Vec<&str> = out.split('\n').filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 48, "cell rows");

@@ -89,7 +89,11 @@ fn check_preview_size(w: u32, h: u32) -> Result<(), Box<dyn std::error::Error>> 
 /// Reject a regular full decode whose decoded buffer would exceed
 /// `PREVIEW_MAX_ALLOC`. `image::Limits::max_alloc` is enforced by some decoders
 /// but not the top-level output buffer allocation, so this is the reliable cap.
-fn check_preview_alloc(w: u32, h: u32, bytes: u64) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn check_preview_alloc(
+    w: u32,
+    h: u32,
+    bytes: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     if bytes > PREVIEW_MAX_ALLOC {
         return Err(preview_alloc_error(w, h));
     }

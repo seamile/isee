@@ -13,6 +13,7 @@ mod kitty;
 mod meta;
 mod sixel;
 mod size;
+mod tile;
 
 use std::fmt;
 #[cfg(windows)]
@@ -223,6 +224,14 @@ fn run_preview(
     };
 
     let mut out = stdout.lock();
+
+    if let Some(count) = args.tile {
+        if args.width.is_some() || args.animate {
+            eprintln!("isee: -w and -a are ignored in tile mode (-t)");
+        }
+        return tile::preview(sources, &term, &opts, count, &mut out)
+            .map_err(|e| AppErr::Fatal(e.to_string()));
+    }
 
     // Multiple files: decode on a small worker pool while the main thread
     // emits blocks strictly in input order. Single file (and stdin) keeps
