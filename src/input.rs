@@ -20,15 +20,40 @@ pub enum Source {
     Stdin,
 }
 
-fn read_all(source: &Source) -> io::Result<Vec<u8>> {
-    match source {
-        Source::Path(p) => fs::read(p),
+#[derive(Debug)]
+pub struct NonImage;
+
+impl std::fmt::Display for NonImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not a supported image; skipping")
+    }
+}
+
+impl std::error::Error for NonImage {}
+
+fn read_all(source: &Source) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let buf = match source {
+        Source::Path(p) => {
+            // Reject directories and special files before reading (a FIFO could block).
+            if !fs::metadata(p)?.is_file() {
+                return Err(NonImage.into());
+            }
+            fs::read(p)?
+        }
         Source::Stdin => {
             let mut buf = Vec::new();
             io::stdin().lock().read_to_end(&mut buf)?;
-            Ok(buf)
+            buf
         }
+    };
+    if is_svg(&buf) || crate::avif::is_avif(&buf) || image::guess_format(&buf).is_ok() {
+        return Ok(buf);
     }
+    #[cfg(target_os = "macos")]
+    if crate::imageio::is_heif(&buf) {
+        return Ok(buf);
+    }
+    Err(NonImage.into())
 }
 
 /// Maximum single edge (width or height) allowed for a regular preview decode.
@@ -40,6 +65,7 @@ const PREVIEW_MAX_DIMENSION: u32 = 12_000;
 const PREVIEW_MAX_ALLOC: u64 = 384 * 1024 * 1024;
 /// Maximum pixel count allowed when rasterizing an SVG preview.
 const SVG_MAX_PIXELS: u64 = 16 * 1024 * 1024;
+const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 /// Maximum cumulative retained-frame budget for an animation decode. Frames
 /// live for the whole preview (a static bitmap is freed after resizing), so
 /// the guard is tighter than `PREVIEW_MAX_ALLOC` and counts the resized
@@ -500,8 +526,119 @@ fn check_svg_size(w: u32, h: u32) -> Result<(), Box<dyn std::error::Error>> {
     )
 }
 
+fn xml_tag_end(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let (mut i, mut quote, mut subset) = (0, 0, 0usize);
+    while i < bytes.len() {
+        if quote != 0 {
+            if bytes[i] == quote {
+                quote = 0;
+            }
+        } else if bytes[i..].starts_with(b"<!--") {
+            i += bytes[i + 4..].windows(3).position(|s| s == b"-->")? + 7;
+            continue;
+        } else if bytes[i..].starts_with(b"<?") {
+            i += bytes[i + 2..].windows(2).position(|s| s == b"?>")? + 4;
+            continue;
+        } else {
+            match bytes[i] {
+                b'\'' | b'"' => quote = bytes[i],
+                b'[' => subset += 1,
+                b']' => subset = subset.saturating_sub(1),
+                b'>' if subset == 0 => return Some(i),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn has_svg_root(text: &str) -> bool {
+    let mut rest = text.trim_start_matches('\u{feff}').trim_start();
+    loop {
+        let end = if rest.starts_with("<!--") {
+            rest.find("-->").map(|i| i + 3)
+        } else if rest.starts_with("<?") {
+            rest.find("?>").map(|i| i + 2)
+        } else if rest.starts_with("<!DOCTYPE") {
+            xml_tag_end(rest).map(|i| i + 1)
+        } else {
+            break;
+        };
+        let Some(end) = end else { return false };
+        rest = rest[end..].trim_start();
+    }
+    if !rest.starts_with('<') {
+        return false;
+    }
+    let Some(end) = xml_tag_end(rest) else {
+        return false;
+    };
+    let head = &text[..text.len() - rest.len() + end];
+    // Parse just the root opening tag, preserving declarations and namespace entities.
+    let probe = format!("{}/>", head.strip_suffix('/').unwrap_or(head));
+    resvg::usvg::roxmltree::Document::parse_with_options(
+        &probe,
+        resvg::usvg::roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .is_ok_and(|doc| doc.root_element().has_tag_name((SVG_NAMESPACE, "svg")))
+}
+
+fn svg_parse_error(buf: &[u8], error: resvg::usvg::Error) -> Box<dyn std::error::Error> {
+    let text = std::str::from_utf8(buf).unwrap_or_else(|e| {
+        std::str::from_utf8(&buf[..e.valid_up_to()]).expect("valid UTF-8 prefix")
+    });
+    if has_svg_root(text) {
+        error.into()
+    } else {
+        NonImage.into()
+    }
+}
+
+fn parse_svg(buf: &[u8]) -> Result<resvg::usvg::Tree, Box<dyn std::error::Error>> {
+    let mut unpacked = Vec::new();
+    let (buf, gzip_failed) = if buf.starts_with(b"\x1f\x8b") {
+        // Retain partial XML so a truncated SVGZ remains an image error.
+        let failed = flate2::read::GzDecoder::new(buf)
+            .read_to_end(&mut unpacked)
+            .is_err();
+        (unpacked.as_slice(), failed)
+    } else {
+        (buf, false)
+    };
+    // A gzip header alone does not identify SVG; comments may precede its root.
+    let start = buf
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(buf)
+        .trim_ascii_start();
+    if !start.starts_with(b"<") {
+        return Err(NonImage.into());
+    }
+    let text = std::str::from_utf8(buf)
+        .map_err(|_| svg_parse_error(buf, resvg::usvg::Error::NotAnUtf8Str))?;
+    let doc = resvg::usvg::roxmltree::Document::parse_with_options(
+        text,
+        resvg::usvg::roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| svg_parse_error(buf, resvg::usvg::Error::ParsingFailed(e)))?;
+    if !doc.root_element().has_tag_name((SVG_NAMESPACE, "svg")) {
+        return Err(NonImage.into());
+    }
+    if gzip_failed {
+        return Err(resvg::usvg::Error::MalformedGZip.into());
+    }
+    Ok(resvg::usvg::Tree::from_xmltree(&doc, &svg_options())?)
+}
+
 fn decode_svg(buf: &[u8]) -> Result<DynamicImage, Box<dyn std::error::Error>> {
-    let tree = resvg::usvg::Tree::from_data(buf, &svg_options())?;
+    let tree = parse_svg(buf)?;
     let size = tree.size();
     let width = size.width().ceil().max(1.0) as u32;
     let height = size.height().ceil().max(1.0) as u32;
@@ -802,7 +939,7 @@ pub struct ImageInfo {
 pub fn load_info(source: &Source) -> Result<ImageInfo, Box<dyn std::error::Error>> {
     let buf = read_all(source)?;
     if is_svg(&buf) {
-        let tree = resvg::usvg::Tree::from_data(&buf, &svg_options())?;
+        let tree = parse_svg(&buf)?;
         let size = tree.size();
         return Ok(ImageInfo {
             size: buf.len() as u64,
@@ -872,6 +1009,24 @@ mod tests {
     // A full-bleed red rect at 0.5 opacity over a transparent background, so a
     // non-demultiplied pixel would read (128, 0, 0, 128) and look too dark.
     const SVG_HALF_RED: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="8"><rect width="10" height="8" fill="rgb(255,0,0)" fill-opacity="0.5"/></svg>"#;
+
+    #[test]
+    fn read_all_recognizes_supported_containers() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for name in [
+            "anim.webp",
+            "small.avif",
+            "small-hbd.avif",
+            "small-opaque.avif",
+        ] {
+            assert!(
+                read_all(&Source::Path(fixtures.join(name))).is_ok(),
+                "{name}"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        assert!(read_all(&Source::Path(fixtures.join("small.heic"))).is_ok());
+    }
 
     #[test]
     fn detects_svg_variants() {

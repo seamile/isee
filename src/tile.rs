@@ -102,18 +102,29 @@ pub fn preview(
         ..load_opts.clone()
     };
     let mut failed = 0;
-    for row in sources.chunks(layout.count as usize) {
-        let mut canvas = RgbaImage::new(layout.width, layout.side);
+    let mut sources = sources.iter();
+    loop {
+        let mut canvas = None;
         let mut titles = String::new();
-        for (col, source) in row.iter().enumerate() {
+        let mut col = 0;
+        while col < layout.count {
+            let Some(source) = sources.next() else { break };
             let path = crate::display_source(source);
-            titles.push_str(&title(&path, layout.cell_cols as usize));
-            if col + 1 < row.len() {
+            let loaded = input::load(source, &load_opts, layout.bounds(), false);
+            if let Err(e) = &loaded
+                && e.is::<input::NonImage>()
+            {
+                eprintln!("isee: {path}: {e}");
+                continue;
+            }
+            let canvas = canvas.get_or_insert_with(|| RgbaImage::new(layout.width, layout.side));
+            if col > 0 {
                 titles.push_str(&" ".repeat(TILE_GAP_COLS as usize));
             }
-            match input::load(source, &load_opts, layout.bounds(), false) {
+            titles.push_str(&title(&path, layout.cell_cols as usize));
+            match loaded {
                 Ok(Loaded::Static(img)) => {
-                    place(&mut canvas, &img, col as u32, &layout, opts);
+                    place(canvas, &img, col, &layout, opts);
                 }
                 Ok(Loaded::Anim(_)) => unreachable!("animation is disabled for tiles"),
                 Err(e) => {
@@ -121,7 +132,9 @@ pub fn preview(
                     failed += 1;
                 }
             }
+            col += 1;
         }
+        let Some(canvas) = canvas else { break };
         let canvas = DynamicImage::ImageRgba8(canvas);
         let block = render_row(&canvas, term, &render_opts, &layout);
         out.write_all(titles.as_bytes())?;

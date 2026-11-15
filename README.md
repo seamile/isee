@@ -37,6 +37,8 @@ isee [OPTIONS] [IMGPATH ...]
 
 If `IMGPATH` is omitted, image data is read from `stdin`.
 
+In all modes, directories, special files, and content not recognized as a supported image are reported on stderr and skipped without titles or image output. Skipped inputs do not count as failures, even if none of the inputs are images. Missing or unreadable paths and recognized images that fail to decode remain errors.
+
 ### Examples
 
 ```sh
@@ -80,7 +82,7 @@ cat /foo/bar/image.jpg | isee
 
 Without `-w`, the terminal window width is the only width cap. A preview is never wider than the terminal window; with `-w` it may be TALLER than the window — graphics scroll with the text. Only the protocol's hard ceiling (the tmux kitty placeholder grid) and a 12000 px/side resource guard apply to height.
 
-With `-t`, the terminal's usable content width (or tmux pane width) is split into square image areas. One terminal-character column is reserved between neighboring areas, so the exact pixel size depends on the terminal cell width; any remainder stays on the right. Areas align to whole terminal columns. Images scale up or down to fit, preserving aspect ratio, and align to the top-left corner without cropping. Each area has its original input path on a separate text line above it; long paths are shortened with `…`. Titles are shown even for a single image (`-` for stdin). Animated images show their first frame. Rows scroll vertically, and an incomplete last row keeps its empty slots. Failed images also keep their slots while later images continue; failures are reported on stderr and produce a nonzero exit status. Excessive column counts are limited to the terminal's capacity with a warning; protocol and preview memory limits still apply. `-i` takes precedence and continues to show image information.
+With `-t`, the terminal's usable content width (or tmux pane width) is split into square image areas. One terminal-character column is reserved between neighboring areas, so the exact pixel size depends on the terminal cell width; any remainder stays on the right. Areas align to whole terminal columns. Images scale up or down to fit, preserving aspect ratio, and align to the top-left corner without cropping. Each area has its original input path on a separate text line above it; long paths are shortened with `…`. Titles are shown even for a single image (`-` for stdin). Animated images show their first frame. Rows scroll vertically, and an incomplete last row keeps its empty slots. Non-image inputs do not occupy slots. Read or decode failures still keep their slots while later images continue; failures are reported on stderr and produce a nonzero exit status. Excessive column counts are limited to the terminal's capacity with a warning; protocol and preview memory limits still apply. `-i` takes precedence and continues to show image information.
 
 ## Compatibility
 

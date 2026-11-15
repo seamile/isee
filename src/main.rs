@@ -173,6 +173,7 @@ fn run_info(sources: &[input::Source], stdout: &io::Stdout) -> Result<(), AppErr
                 out.flush().map_err(|e| AppErr::Fatal(e.to_string()))?;
                 wrote_before = true;
             }
+            Err(e) if e.is::<input::NonImage>() => eprintln!("isee: {path}: {e}"),
             Err(e) => {
                 if !multi {
                     return Err(AppErr::Fatal(e.to_string()));
@@ -252,6 +253,7 @@ fn run_preview(
                 out.flush().map_err(|e| AppErr::Fatal(e.to_string()))?;
                 wrote_before = true;
             }
+            Err(e) if e.is::<input::NonImage>() => eprintln!("isee: {path}: {e}"),
             Err(e) => return Err(AppErr::Fatal(e.to_string())),
         }
     }
@@ -407,7 +409,7 @@ fn preview_parallel(
     let next = AtomicUsize::new(0);
     let stop = AtomicUsize::new(0);
     let workers = sources.len().clamp(1, PREVIEW_WORKERS);
-    let (tx, rx) = mpsc::channel::<(usize, String, Result<Vec<u8>, String>)>();
+    let (tx, rx) = mpsc::channel::<(usize, String, Result<Vec<u8>, (String, bool)>)>();
 
     std::thread::scope(|scope| -> Result<(), AppErr> {
         for _ in 0..workers {
@@ -426,7 +428,7 @@ fn preview_parallel(
                         note_protocol_clamp(loaded, term, opts);
                     }
                     let res = res
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| (e.to_string(), e.is::<input::NonImage>()))
                         .map(|loaded| render_loaded(&loaded, term, opts));
                     if tx.send((i, path, res)).is_err() {
                         break;
@@ -437,7 +439,7 @@ fn preview_parallel(
 
         // Reorder worker output by input index: hold early finishers until
         // every predecessor has been emitted.
-        let mut pending: BTreeMap<usize, (String, Result<Vec<u8>, String>)> = BTreeMap::new();
+        let mut pending = BTreeMap::new();
         let mut expect = 0usize;
         let mut wrote_before = false;
         let mut failed = 0usize;
@@ -454,9 +456,11 @@ fn preview_parallel(
                         out.flush().map_err(|e| AppErr::Fatal(e.to_string()))?;
                         wrote_before = true;
                     }
-                    Err(e) => {
+                    Err((e, skipped)) => {
                         eprintln!("isee: {path}: {e}");
-                        failed += 1;
+                        if !skipped {
+                            failed += 1;
+                        }
                     }
                 }
                 expect += 1;
