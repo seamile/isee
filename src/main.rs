@@ -230,7 +230,7 @@ fn run_preview(
         if args.width.is_some() || args.animate {
             eprintln!("isee: -w and -a are ignored in tile mode (-t)");
         }
-        return tile::preview(sources, &term, &opts, count, &mut out)
+        return tile::preview(sources, &term, &opts, count, args.crop, &mut out)
             .map_err(|e| AppErr::Fatal(e.to_string()));
     }
 
@@ -238,13 +238,21 @@ fn run_preview(
     // emits blocks strictly in input order. Single file (and stdin) keeps
     // the plain serial path below.
     if multi {
-        return preview_parallel(sources, &term, &opts, bounds, args.animate, &mut out);
+        return preview_parallel(
+            sources,
+            &term,
+            &opts,
+            bounds,
+            args.animate,
+            args.crop,
+            &mut out,
+        );
     }
 
     let mut wrote_before = false;
     for source in sources {
         let path = display_source(source);
-        match input::load(source, &opts, bounds, args.animate) {
+        match input::load(source, &opts, bounds, args.animate, args.crop) {
             Ok(loaded) => {
                 note_protocol_clamp(&loaded, &term, &opts);
                 let block = render_loaded(&loaded, &term, &opts);
@@ -400,6 +408,7 @@ fn preview_parallel(
     opts: &size::RenderOpts,
     bounds: size::Bounds,
     animate: bool,
+    crop: Option<[u32; 4]>,
     out: &mut dyn Write,
 ) -> Result<(), AppErr> {
     use std::collections::BTreeMap;
@@ -423,7 +432,7 @@ fn preview_parallel(
                         break;
                     }
                     let path = display_source(&sources[i]);
-                    let res = input::load(&sources[i], opts, bounds, animate);
+                    let res = input::load(&sources[i], opts, bounds, animate, crop);
                     if let Ok(loaded) = &res {
                         note_protocol_clamp(loaded, term, opts);
                     }

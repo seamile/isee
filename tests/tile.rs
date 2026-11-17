@@ -119,6 +119,55 @@ fn info_takes_precedence_and_tile_counts_are_validated() {
 }
 
 #[test]
+fn crop_precedes_width_scaling_and_applies_before_tiling() {
+    let dir = std::env::temp_dir().join(format!("isee-crop-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let full = dir.join("full.ppm");
+    let crop = dir.join("crop.ppm");
+    let pixels = [255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0].repeat(2);
+    let mut full_data = b"P6\n4 4\n255\n".to_vec();
+    full_data.extend_from_slice(&pixels.repeat(2));
+    std::fs::write(&full, full_data).unwrap();
+    let mut crop_data = b"P6\n2 2\n255\n".to_vec();
+    crop_data.extend_from_slice(&pixels);
+    std::fs::write(&crop, crop_data).unwrap();
+
+    let full = full.to_str().unwrap();
+    let crop = crop.to_str().unwrap();
+    let cropped = isee(&["-p", "halfblock", "-c", "0,0,2,2", "-w", "4", full]);
+    let standalone = isee(&["-p", "halfblock", "-w", "4", crop]);
+    let crop_after_scale = isee(&["-p", "halfblock", "-c", "0,0,4,4", "-w", "4", crop]);
+    assert!(cropped.status.success(), "{:?}", cropped.stderr);
+    assert_eq!(cropped.stdout, standalone.stdout);
+    assert_ne!(cropped.stdout, crop_after_scale.stdout);
+
+    let tiled = isee(&["-p", "halfblock", "-c", "0,0,2,2", "-t", "2", full]);
+    assert!(tiled.status.success(), "{:?}", tiled.stderr);
+    let text = String::from_utf8(tiled.stdout).unwrap();
+    assert!(text.lines().count() < 22, "{text:?}");
+    assert!(!text.contains("image failed"), "{text}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn out_of_bounds_crop_fails_without_blocking_later_images() {
+    let path = std::env::temp_dir().join(format!("isee-crop-oob-{}.ppm", std::process::id()));
+    let mut ppm = b"P6\n800 100\n255\n".to_vec();
+    ppm.resize(ppm.len() + 800 * 100 * 3, 0xff);
+    std::fs::write(&path, ppm).unwrap();
+    let path = path.to_str().unwrap();
+    let output = isee(&["-p", "halfblock", "-c", "0,0,10000,1", path]);
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("crop (0,0,10000,1) exceeds image bounds"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn stdin_has_a_title_in_tile_mode() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_isee"))
         .args(["-p", "halfblock", "-t3"])

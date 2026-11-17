@@ -81,6 +81,7 @@ pub fn preview(
     term: &TerminalInfo,
     opts: &RenderOpts,
     count: u32,
+    crop: Option<[u32; 4]>,
     out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
     let layout = Layout::new(opts, term.protocol, count)?;
@@ -109,7 +110,7 @@ pub fn preview(
         while col < layout.count {
             let Some(source) = sources.next() else { break };
             let path = crate::display_source(source);
-            let loaded = input::load(source, &load_opts, layout.bounds(), false);
+            let loaded = input::load(source, &load_opts, layout.bounds(), false, crop);
             if let Err(e) = &loaded
                 && e.is::<input::NonImage>()
             {
@@ -358,6 +359,7 @@ mod tests {
             &term(Protocol::HalfBlocks, &o),
             &o,
             3,
+            None,
             &mut Closed,
         )
         .unwrap_err();
@@ -377,7 +379,17 @@ mod tests {
         let o = opts();
         let layout = Layout::new(&o, Protocol::HalfBlocks, 3).unwrap();
         let mut out = Vec::new();
-        assert!(preview(&[source], &term(Protocol::HalfBlocks, &o), &o, 3, &mut out).is_err());
+        assert!(
+            preview(
+                &[source],
+                &term(Protocol::HalfBlocks, &o),
+                &o,
+                3,
+                None,
+                &mut out,
+            )
+            .is_err()
+        );
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!("{}\r\n", title(&path, layout.cell_cols as usize))

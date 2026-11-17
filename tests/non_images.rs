@@ -4,6 +4,7 @@ use std::process::{Command, Output, Stdio};
 const IMAGE: &str = "tests/fixtures/anim.webp";
 const MODES: &[&[&str]] = &[
     &["-p", "halfblock"],
+    &["-p", "halfblock", "-c", "0,0,1,1"],
     &["-p", "halfblock", "-a"],
     &["-p", "halfblock", "-t3"],
     &["-i"],

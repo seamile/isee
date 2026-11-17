@@ -48,6 +48,9 @@ isee /foo/bar/image.jpg
 # Preview with width 800px
 isee -w 800 /foo/bar/image.jpg
 
+# Crop before preview scaling
+isee -c 100,50,500,250 -w 800 /foo/bar/image.jpg
+
 # Tile three images per row
 isee -t 3 *.jpg
 
@@ -72,6 +75,7 @@ cat /foo/bar/image.jpg | isee
 ### Options
 
 - `-w WIDTH`: Preview at the given pixel width (e.g. `-w 800` for 800px); `-w 0` uses the image's native width
+- `-c X1,Y1,X2,Y2`: Show the rectangle between two pixel coordinates, then apply preview scaling; `-c` accepts either order of corner points. Combined with `-t`, the crop applies before tiling
 - `-t COUNT`: Tile images in COUNT columns (also accepts `-t3`); COUNT must be positive. Ignores `-w` and `-a` with a warning
 - `-q QUALITY`: Preview scaling quality: `L` (nearest, fastest), `M` (triangle, default), `H` (lanczos, sharpest)
 - `-p PROTOCOL`: Force the preview protocol: `auto` (default), `kitty`, `iip`, `sixel`, or `halfblock` — for terminals whose environment does not identify them (e.g. over ssh)
@@ -81,6 +85,8 @@ cat /foo/bar/image.jpg | isee
 - `-h, --help`: Print help
 
 Without `-w`, the terminal window width is the only width cap. A preview is never wider than the terminal window; with `-w` it may be TALLER than the window — graphics scroll with the text. Only the protocol's hard ceiling (the tmux kitty placeholder grid) and a 12000 px/side resource guard apply to height.
+
+With `-c`, coordinates use the decoded image before any preview scaling. The origin is the top-left; x increases to the right and y increases downward. The two points select a left-closed, right-open rectangle, so `0,0,width,height` selects the full image. Each coordinate must be within its axis, and the rectangle must have non-zero width and height. SVG coordinates refer to the rasterized canvas, so they follow the SVG's displayed size rather than its internal `viewBox` units. Animated images are cropped from their first frame. `-c` applies before `-w`, and in tile mode it applies before each image is fitted to its tile.
 
 With `-t`, the terminal's usable content width (or tmux pane width) is split into square image areas. One terminal-character column is reserved between neighboring areas, so the exact pixel size depends on the terminal cell width; any remainder stays on the right. Areas align to whole terminal columns. Images scale up or down to fit, preserving aspect ratio, and align to the top-left corner without cropping. Each row is shortened to the bottom edge of its tallest image. Each area has its original input path on a separate text line above it; long paths are shortened with `…`. Titles are shown even for a single image (`-` for stdin). Animated images show their first frame. Rows scroll vertically, and an incomplete last row keeps its empty slots. Non-image inputs do not occupy slots. Read or decode failures still keep their slots while later images continue; failures are reported on stderr and produce a nonzero exit status. Excessive column counts are limited to the terminal's capacity with a warning; protocol and preview memory limits still apply. `-i` takes precedence and continues to show image information.
 

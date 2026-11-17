@@ -746,8 +746,20 @@ pub fn load(
     opts: &RenderOpts,
     bounds: size::Bounds,
     animate: bool,
+    crop: Option<[u32; 4]>,
 ) -> Result<Loaded, Box<dyn std::error::Error>> {
     let buf = read_all(source)?;
+    if let Some(crop) = crop {
+        validate_crop(decoded_dims(&buf)?, crop)?;
+        let (img, _) = decode_full(&buf)?;
+        let img = crop_image(img, crop);
+        return Ok(Loaded::Static(shrink_to_points(
+            img,
+            opts.dpy_scale,
+            opts,
+            bounds,
+        )));
+    }
     if animate
         && is_gif(&buf)
         && let Ok(anim) = decode_gif(&buf, opts, bounds, opts.dpy_scale)
@@ -762,6 +774,76 @@ pub fn load(
     }
     let img = decode_for_preview(&buf, opts, bounds, opts.dpy_scale)?;
     Ok(Loaded::Static(img))
+}
+
+fn crop_image(img: DynamicImage, [x1, y1, x2, y2]: [u32; 4]) -> DynamicImage {
+    let (width, height) = img.dimensions();
+    let (left, right) = (x1.min(x2), x1.max(x2));
+    let (top, bottom) = (y1.min(y2), y1.max(y2));
+    assert!(
+        right <= width && bottom <= height,
+        "crop validated before decode"
+    );
+    img.crop_imm(left, top, right - left, bottom - top)
+}
+
+fn validate_crop(
+    [width, height]: [u32; 2],
+    [x1, y1, x2, y2]: [u32; 4],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if x1 > width || x2 > width || y1 > height || y2 > height {
+        return Err(
+            format!("crop ({x1},{y1},{x2},{y2}) exceeds image bounds {width}x{height}").into(),
+        );
+    }
+    Ok(())
+}
+
+/// Read only the displayed dimensions, so an out-of-bounds crop can fail
+/// before a full decode hits the larger image's resource guard.
+fn decoded_dims(buf: &[u8]) -> Result<[u32; 2], Box<dyn std::error::Error>> {
+    if is_svg(buf) {
+        let size = parse_svg(buf)?.size();
+        return Ok([
+            size.width().ceil().max(1.0) as u32,
+            size.height().ceil().max(1.0) as u32,
+        ]);
+    }
+    if crate::avif::is_avif(buf) {
+        let info = crate::avif::load_info(buf)?;
+        return Ok([info.width, info.height]);
+    }
+    #[cfg(target_os = "macos")]
+    if crate::imageio::is_heif(buf) {
+        let info = crate::imageio::load_info(buf)?;
+        return Ok([info.width, info.height]);
+    }
+    let reader = ImageReader::new(Cursor::new(buf)).with_guessed_format()?;
+    let mut decoder = reader.into_decoder()?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let (width, height) = decoder.dimensions();
+    Ok(oriented_dims(width, height, orientation).into())
+}
+
+#[cfg(test)]
+fn load_bytes(
+    buf: &[u8],
+    opts: &RenderOpts,
+    bounds: size::Bounds,
+    animate: bool,
+    crop: Option<[u32; 4]>,
+) -> Result<Loaded, Box<dyn std::error::Error>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "isee_load_bytes_{}_{}.bin",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, buf)?;
+    let result = load(&Source::Path(path.clone()), opts, bounds, animate, crop);
+    let _ = std::fs::remove_file(path);
+    result
 }
 
 /// A single composited animation frame, resized to the shared preview target.
@@ -1514,14 +1596,101 @@ mod tests {
         std::fs::write(&path, &buf).unwrap();
         let o = opts_width(None);
         let bounds = size::Bounds::window(10_000, 10_000);
-        let without_flag = load(&Source::Path(path.clone()), &o, bounds, false).unwrap();
+        let without_flag = load(&Source::Path(path.clone()), &o, bounds, false, None).unwrap();
         assert!(matches!(without_flag, Loaded::Static(_)));
-        let with_flag = load(&Source::Path(path.clone()), &o, bounds, true).unwrap();
+        let with_flag = load(&Source::Path(path.clone()), &o, bounds, true, None).unwrap();
         let Loaded::Anim(anim) = with_flag else {
             panic!("expected an animated load with -a");
         };
         assert_eq!(anim.frames.len(), 2);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn crop_uses_original_coordinates_and_precedes_preview_scaling() {
+        let img = image::RgbaImage::from_fn(4, 4, |x, y| {
+            image::Rgba([(x * 10) as u8, (y * 10) as u8, 0, 255])
+        });
+        let mut png = Vec::new();
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let o = opts_width(Some(4));
+        let bounds = size::Bounds::window(10_000, 10_000);
+        let Loaded::Static(img) = load_bytes(&png, &o, bounds, false, Some([3, 3, 1, 1])).unwrap()
+        else {
+            panic!("crop must be static");
+        };
+        assert_eq!(img.dimensions(), (2, 2));
+        assert_eq!(
+            img.to_rgba8().get_pixel(0, 0),
+            &image::Rgba([10, 10, 0, 255])
+        );
+        assert_eq!(
+            img.to_rgba8().get_pixel(1, 1),
+            &image::Rgba([20, 20, 0, 255])
+        );
+    }
+
+    #[test]
+    fn crop_rejects_coordinates_outside_the_decoded_image() {
+        let png = encode_png(4, 3);
+        let o = opts_width(None);
+        let bounds = size::Bounds::window(10_000, 10_000);
+        for crop in [[0, 0, 5, 1], [0, 0, 1, 4]] {
+            let Err(err) = load_bytes(&png, &o, bounds, false, Some(crop)) else {
+                panic!("out-of-bounds crop must fail");
+            };
+            let err = err.to_string();
+            assert!(err.contains("exceeds image bounds"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn out_of_bounds_crop_reports_bounds_before_resource_limits() {
+        let png = encode_png(12_001, 10);
+        let o = opts_width(None);
+        let bounds = size::Bounds::window(10_000, 10_000);
+        let Err(err) = load_bytes(&png, &o, bounds, false, Some([0, 0, 12_002, 1])) else {
+            panic!("out-of-bounds crop must fail");
+        };
+        assert!(err.to_string().contains("exceeds image bounds 12001x10"));
+    }
+
+    #[test]
+    fn crop_uses_first_frame_when_animation_is_requested() {
+        let frames = [
+            anim_frame(4, 4, [255, 0, 0], 5),
+            anim_frame(4, 4, [0, 255, 0], 5),
+        ];
+        let gif = encode_gif(&frames, Repeat::Infinite);
+        let o = opts_width(None);
+        let bounds = size::Bounds::window(10_000, 10_000);
+        let Loaded::Static(img) = load_bytes(&gif, &o, bounds, true, Some([1, 1, 3, 3])).unwrap()
+        else {
+            panic!("crop must disable animation");
+        };
+        assert_eq!(img.dimensions(), (2, 2));
+        assert_eq!(
+            img.to_rgba8().get_pixel(0, 0),
+            &image::Rgba([255, 0, 0, 255])
+        );
+    }
+
+    #[test]
+    fn crop_applies_to_the_svg_raster_canvas() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4" viewBox="0 0 8 8"><rect width="8" height="8" fill="red"/></svg>"##;
+        let o = opts_width(None);
+        let bounds = size::Bounds::window(10_000, 10_000);
+        let Loaded::Static(img) = load_bytes(svg, &o, bounds, false, Some([1, 1, 3, 3])).unwrap()
+        else {
+            panic!("SVG crop must be static");
+        };
+        assert_eq!(img.dimensions(), (2, 2));
+        assert_eq!(
+            img.to_rgba8().get_pixel(0, 0),
+            &image::Rgba([255, 0, 0, 255])
+        );
     }
 
     // ---- WebP animation ----
@@ -1617,9 +1786,9 @@ mod tests {
         std::fs::write(&path, WEBP_ANIM).unwrap();
         let o = opts_width(None);
         let bounds = size::Bounds::window(10_000, 10_000);
-        let without_flag = load(&Source::Path(path.clone()), &o, bounds, false).unwrap();
+        let without_flag = load(&Source::Path(path.clone()), &o, bounds, false, None).unwrap();
         assert!(matches!(without_flag, Loaded::Static(_)));
-        let with_flag = load(&Source::Path(path.clone()), &o, bounds, true).unwrap();
+        let with_flag = load(&Source::Path(path.clone()), &o, bounds, true, None).unwrap();
         let Loaded::Anim(anim) = with_flag else {
             panic!("expected an animated load with -a");
         };
@@ -1636,7 +1805,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("isee_webp_static_{}.webp", std::process::id()));
         std::fs::write(&path, &buf).unwrap();
-        let loaded = load(&Source::Path(path.clone()), &o, bounds, true).unwrap();
+        let loaded = load(&Source::Path(path.clone()), &o, bounds, true, None).unwrap();
         assert!(matches!(loaded, Loaded::Static(_)));
         let _ = std::fs::remove_file(&path);
     }

@@ -7,6 +7,7 @@ use crate::size::Quality;
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Args {
     pub width: Option<u32>,
+    pub crop: Option<[u32; 4]>,
     pub tile: Option<u32>,
     pub quality: Quality,
     pub info: bool,
@@ -21,6 +22,7 @@ pub enum ParseError {
     Version,
     MissingValue(&'static str),
     InvalidNumber(&'static str, String),
+    InvalidCrop(String),
     InvalidQuality(String),
     InvalidProtocol(String),
     UnknownOption(String),
@@ -33,6 +35,10 @@ impl fmt::Display for ParseError {
             ParseError::Version => write!(f, "version"),
             ParseError::MissingValue(opt) => write!(f, "option {opt} requires a value"),
             ParseError::InvalidNumber(opt, v) => write!(f, "invalid value {v:?} for option {opt}"),
+            ParseError::InvalidCrop(v) => write!(
+                f,
+                "invalid crop {v:?}: expected x1,y1,x2,y2 with non-negative integers and a non-zero width and height"
+            ),
             ParseError::InvalidQuality(v) => {
                 write!(f, "invalid quality {v:?}: expected L, M or H")
             }
@@ -56,6 +62,10 @@ Options:
              Without -w, the terminal window width is the only cap. A
              preview is never wider than the terminal window; its height
              may exceed the window (the terminal scrolls vertically).
+  -c X1,Y1,X2,Y2
+             Show only the rectangle between two pixels; coordinates are
+             top-left based and use the image before preview scaling. In
+             tile mode, crop applies before tiling.
   -t COUNT   Tile COUNT images per row in square areas; scale to fit,
              keeping aspect ratio. Ignores -w and -a.
   -q QUALITY Preview scaling quality: L (nearest), M (triangle), H (lanczos);
@@ -81,6 +91,10 @@ where
             out.width = Some(parse_num("-w", v)?);
             continue;
         }
+        if let Some(v) = arg.strip_prefix("-c").filter(|v| v.contains(',')) {
+            out.crop = Some(parse_crop(v)?);
+            continue;
+        }
         if let Some(v) = short_value("-t", &arg) {
             out.tile = Some(parse_tile(v)?);
             continue;
@@ -101,6 +115,10 @@ where
             "-w" => {
                 let v = it.next().ok_or(ParseError::MissingValue("-w"))?;
                 out.width = Some(parse_num("-w", &v)?);
+            }
+            "-c" => {
+                let v = it.next().ok_or(ParseError::MissingValue("-c"))?;
+                out.crop = Some(parse_crop(&v)?);
             }
             "-t" => {
                 let v = it.next().ok_or(ParseError::MissingValue("-t"))?;
@@ -140,6 +158,21 @@ fn parse_tile(v: &str) -> Result<u32, ParseError> {
         return Err(ParseError::InvalidNumber("-t", v.to_string()));
     }
     Ok(count)
+}
+
+fn parse_crop(v: &str) -> Result<[u32; 4], ParseError> {
+    let parts: Vec<_> = v.split(',').map(str::trim).collect();
+    let [x1, y1, x2, y2] = parts.as_slice() else {
+        return Err(ParseError::InvalidCrop(v.to_string()));
+    };
+    let nums = [x1, y1, x2, y2]
+        .map(|part| parse_num("-c", part).map_err(|_| ParseError::InvalidCrop(v.to_string())));
+    let [x1, y1, x2, y2] = nums;
+    let crop = [x1?, y1?, x2?, y2?];
+    if crop[0] == crop[2] || crop[1] == crop[3] {
+        return Err(ParseError::InvalidCrop(v.to_string()));
+    }
+    Ok(crop)
 }
 
 fn parse_quality(v: &str) -> Result<Quality, ParseError> {
@@ -212,6 +245,34 @@ mod tests {
         assert_eq!(a.width, Some(800));
         assert_eq!(a.quality, Quality::High);
         assert_eq!(a.paths, vec![PathBuf::from("img.png")]);
+    }
+
+    #[test]
+    fn parse_crop_accepts_both_attached_and_separate_values() {
+        let expected = Some([10, 20, 30, 40]);
+        assert_eq!(parse(["-c", "10,20,30,40"]).unwrap().crop, expected);
+        assert_eq!(parse(["-c10,20,30,40"]).unwrap().crop, expected);
+        assert_eq!(parse(["-c", "10, 20, 30, 40"]).unwrap().crop, expected);
+    }
+
+    #[test]
+    fn parse_crop_rejects_bad_shape_numbers_and_zero_area() {
+        assert!(matches!(parse(["-c"]), Err(ParseError::MissingValue("-c"))));
+        for value in [
+            "1,2,3",
+            "1,2,3,4,5",
+            "-1,0,1,1",
+            "0,0,1.5,1",
+            "0,0,abc,1",
+            "0,0,4294967296,1",
+            "1,0,1,1",
+            "0,1,1,1",
+        ] {
+            assert!(
+                matches!(parse(["-c", value]), Err(ParseError::InvalidCrop(_))),
+                "value: {value}"
+            );
+        }
     }
 
     #[test]
