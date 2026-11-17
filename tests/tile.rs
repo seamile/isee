@@ -21,25 +21,51 @@ fn halfblock_cells(line: &str) -> Vec<&str> {
         .collect()
 }
 
+fn wide_ppm() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("isee-wide-tile-{}.ppm", std::process::id()));
+    let mut ppm = b"P6\n800 100\n255\n".to_vec();
+    ppm.resize(ppm.len() + 800 * 100 * 3, 0xff);
+    std::fs::write(&path, ppm).unwrap();
+    path
+}
+
 #[test]
 fn tile_rows_keep_order_and_the_incomplete_last_row() {
     let output = isee(&["-p", "halfblock", "-t3", IMAGE, IMAGE, IMAGE, IMAGE]);
     assert!(output.status.success(), "{:?}", output.stderr);
     let text = String::from_utf8(output.stdout).unwrap();
     let lines: Vec<_> = text.lines().collect();
-    // Non-tty defaults: 80 columns, 7x14 px cells; 26-column tiles and two gaps.
-    assert_eq!(lines.len(), 28);
+    // The next title follows the last image line directly.
+    assert_eq!(lines.len(), 22);
     assert_eq!(lines[0], format!("{IMAGE:<26} {IMAGE:<26} {IMAGE:<26}"));
-    assert_eq!(lines[14], format!("{IMAGE:<26}"));
-    for index in [1, 13, 15, 27] {
+    assert_eq!(lines[11], format!("{IMAGE:<26}"));
+    for index in [1, 10, 12, 21] {
         let cells = halfblock_cells(lines[index]);
         assert_eq!(cells.len(), 80);
         assert_eq!(cells[26], "\x1b[0m ");
         assert_eq!(cells[53], "\x1b[0m ");
-        if index >= 15 {
+        if index >= 12 {
             assert!(cells[26..].iter().all(|cell| *cell == "\x1b[0m "));
         }
     }
+}
+
+#[test]
+fn wide_rows_end_after_their_tallest_image() {
+    let path = wide_ppm();
+    let path = path.to_str().unwrap();
+    let output = isee(&["-p", "halfblock", "-t3", path, path, path, path]);
+    std::fs::remove_file(path).unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+
+    let text = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    // An 8:1 image uses two 14px character rows in the 182px-wide tiles.
+    assert_eq!(lines.len(), 6);
+    assert!(
+        !lines[3].is_empty(),
+        "the second title must follow the image"
+    );
 }
 
 #[test]
@@ -68,7 +94,8 @@ fn failed_image_keeps_its_slot_and_later_images_still_render() {
         "{IMAGE:<26} tests/fixtures/missing-ti… {IMAGE:<26}\r\n"
     )));
     // The first and third slots contain the same image, the middle one is blank.
-    for line in text.lines().skip(1) {
+    let lines: Vec<_> = text.lines().collect();
+    for line in &lines[1..] {
         let cells = halfblock_cells(line);
         assert_eq!(cells.len(), 80);
         assert_eq!(&cells[..26], &cells[54..]);

@@ -16,7 +16,6 @@ struct Layout {
     side: u32,
     gap_px: u32,
     width: u32,
-    rows: u32,
 }
 
 impl Layout {
@@ -65,7 +64,6 @@ impl Layout {
             side,
             gap_px,
             width,
-            rows,
         })
     }
 
@@ -105,6 +103,7 @@ pub fn preview(
     let mut sources = sources.iter();
     loop {
         let mut canvas = None;
+        let mut row_height = 0;
         let mut titles = String::new();
         let mut col = 0;
         while col < layout.count {
@@ -124,7 +123,7 @@ pub fn preview(
             titles.push_str(&title(&path, layout.cell_cols as usize));
             match loaded {
                 Ok(Loaded::Static(img)) => {
-                    place(canvas, &img, col, &layout, opts);
+                    row_height = row_height.max(place(canvas, &img, col, &layout, opts));
                 }
                 Ok(Loaded::Anim(_)) => unreachable!("animation is disabled for tiles"),
                 Err(e) => {
@@ -135,8 +134,12 @@ pub fn preview(
             col += 1;
         }
         let Some(canvas) = canvas else { break };
-        let canvas = DynamicImage::ImageRgba8(canvas);
-        let block = render_row(&canvas, term, &render_opts, &layout);
+        let block = if row_height == 0 {
+            Vec::new()
+        } else {
+            let canvas = DynamicImage::ImageRgba8(canvas).crop_imm(0, 0, layout.width, row_height);
+            render_row(&canvas, term, &render_opts, &layout)
+        };
         out.write_all(titles.as_bytes())?;
         out.write_all(b"\r\n")?;
         out.write_all(&block)?;
@@ -148,10 +151,18 @@ pub fn preview(
     Ok(())
 }
 
-fn place(canvas: &mut RgbaImage, img: &DynamicImage, col: u32, layout: &Layout, opts: &RenderOpts) {
+fn place(
+    canvas: &mut RgbaImage,
+    img: &DynamicImage,
+    col: u32,
+    layout: &Layout,
+    opts: &RenderOpts,
+) -> u32 {
     let img = img.resize(layout.side, layout.side, size::filter(opts.quality));
+    let height = img.height();
     let x = col * (layout.side + layout.gap_px);
     image::imageops::overlay(canvas, &img.to_rgba8(), i64::from(x), 0);
+    height
 }
 
 fn render_row(
@@ -162,7 +173,8 @@ fn render_row(
 ) -> Vec<u8> {
     if term.protocol == Protocol::HalfBlocks {
         let gaps = layout.count.saturating_sub(1) * TILE_GAP_COLS;
-        let mut grid = RgbaImage::new(layout.cell_cols * layout.count + gaps, layout.rows * 2);
+        let rows = img.height().div_ceil(opts.cell.h.max(1));
+        let mut grid = RgbaImage::new(layout.cell_cols * layout.count + gaps, rows * 2);
         for col in 0..layout.count {
             // Sample tiles separately so the filter cannot bleed into an empty neighbor.
             let tile = img
@@ -170,13 +182,9 @@ fn render_row(
                     col * (layout.side + layout.gap_px),
                     0,
                     layout.side,
-                    layout.side,
+                    img.height(),
                 )
-                .resize_exact(
-                    layout.cell_cols,
-                    layout.rows * 2,
-                    size::filter(opts.quality),
-                )
+                .resize_exact(layout.cell_cols, rows * 2, size::filter(opts.quality))
                 .into_rgba8();
             image::imageops::replace(
                 &mut grid,
@@ -250,7 +258,7 @@ mod tests {
     fn square_areas_use_terminal_width_not_height() {
         let layout = Layout::new(&opts(), Protocol::Kitty, 3).unwrap();
         assert_eq!((layout.count, layout.cell_cols), (3, 63));
-        assert_eq!((layout.width, layout.side, layout.rows), (1910, 630, 32));
+        assert_eq!((layout.width, layout.side), (1910, 630));
         for protocol in [Protocol::Kitty, Protocol::Iip, Protocol::Sixel] {
             let o = RenderOpts {
                 width: Some(layout.width),
@@ -296,7 +304,10 @@ mod tests {
         o.win.px = None;
         let layout = Layout::new(&o, Protocol::Kitty, 1).unwrap();
         assert_eq!((layout.width, layout.side), (2970, 2970));
-        assert!(layout.rows as usize <= crate::kitty::MAX_PLACEHOLDER_CELLS);
+        assert!(
+            layout.side.div_ceil(size::kitty_cell(&o).1) as usize
+                <= crate::kitty::MAX_PLACEHOLDER_CELLS
+        );
         o.cell.h = 1;
         let layout = Layout::new(&o, Protocol::Kitty, 1).unwrap();
         assert_eq!(layout.side, 290);
@@ -324,10 +335,7 @@ mod tests {
             px: None,
         };
         let layout = Layout::new(&o, Protocol::HalfBlocks, 3).unwrap();
-        assert_eq!(
-            (layout.count, layout.cell_cols, layout.side, layout.rows),
-            (1, 1, 10, 1)
-        );
+        assert_eq!((layout.count, layout.cell_cols, layout.side), (1, 1, 10));
     }
 
     #[test]
@@ -360,6 +368,23 @@ mod tests {
     }
 
     #[test]
+    fn failed_images_keep_titles_without_a_square_image_row() {
+        let source = Source::Path(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/missing-tile-row.png"),
+        );
+        let path = crate::display_source(&source);
+        let o = opts();
+        let layout = Layout::new(&o, Protocol::HalfBlocks, 3).unwrap();
+        let mut out = Vec::new();
+        assert!(preview(&[source], &term(Protocol::HalfBlocks, &o), &o, 3, &mut out).is_err());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{}\r\n", title(&path, layout.cell_cols as usize))
+        );
+    }
+
+    #[test]
     fn images_enlarge_and_align_to_the_top_left_without_cropping() {
         let o = RenderOpts {
             quality: Quality::Low,
@@ -371,14 +396,13 @@ mod tests {
             side: 8,
             gap_px: 1,
             width: 26,
-            rows: 1,
         };
         let red = image::Rgba([255, 0, 0, 255]);
         let wide = DynamicImage::ImageRgba8(RgbaImage::from_pixel(4, 2, red));
         let tall = DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 4, red));
         let mut canvas = RgbaImage::new(26, 8);
-        place(&mut canvas, &wide, 0, &layout, &o);
-        place(&mut canvas, &tall, 1, &layout, &o);
+        assert_eq!(place(&mut canvas, &wide, 0, &layout, &o), 4);
+        assert_eq!(place(&mut canvas, &tall, 1, &layout, &o), 8);
         assert_eq!(canvas.get_pixel(0, 0), &red);
         assert_eq!(canvas.get_pixel(7, 3), &red);
         assert_eq!(canvas.get_pixel(0, 4)[3], 0);
@@ -420,7 +444,7 @@ mod tests {
             Protocol::HalfBlocks,
         ] {
             let layout = Layout::new(&o, protocol, 3).unwrap();
-            let img = DynamicImage::ImageRgba8(RgbaImage::new(layout.width, layout.side));
+            let img = DynamicImage::ImageRgba8(RgbaImage::new(layout.width, 5));
             let tile = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
                 1,
                 1,
@@ -438,9 +462,9 @@ mod tests {
             let block = render_row(&img, &term(protocol, &row_opts), &row_opts, &layout);
             let text = String::from_utf8_lossy(&block);
             match protocol {
-                Protocol::Kitty => assert!(text.contains("a=T,s=50,v=10,")),
-                Protocol::Iip => assert!(text.contains("width=50px;height=10px:")),
-                Protocol::Sixel => assert!(text.contains("\"1;1;50;10")),
+                Protocol::Kitty => assert!(text.contains("a=T,s=50,v=5,")),
+                Protocol::Iip => assert!(text.contains("width=50px;height=5px:")),
+                Protocol::Sixel => assert!(text.contains("\"1;1;50;5")),
                 Protocol::HalfBlocks => {
                     assert_eq!(text.matches('▀').count(), 3);
                     assert_eq!(text.matches(' ').count(), 2);
